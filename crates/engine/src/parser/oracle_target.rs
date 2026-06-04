@@ -3933,6 +3933,7 @@ pub(crate) fn attachment_kinds_filter_prop(
         [kind] => FilterProp::HasAttachment {
             kind: kind.clone(),
             controller,
+            exclude_source: false,
         },
         _ => FilterProp::HasAnyAttachmentOf { kinds, controller },
     }
@@ -8912,6 +8913,7 @@ mod tests {
             FilterProp::HasAttachment {
                 kind: AttachmentKind::Aura,
                 controller: None,
+                ..
             }
         ));
     }
@@ -8926,6 +8928,7 @@ mod tests {
             FilterProp::HasAttachment {
                 kind: AttachmentKind::Equipment,
                 controller: None,
+                ..
             }
         ));
     }

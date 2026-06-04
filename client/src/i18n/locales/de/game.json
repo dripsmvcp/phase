@@ -409,6 +409,7 @@
     "chooseNewTargetForCopy": "Wähle ein neues Ziel für die Kopie",
     "chooseTargetForCopy": "Wähle ein Ziel für die Kopie",
     "chooseCreatureToExplore": "Wähle, welche Kreatur als Nächstes erkundet",
+    "chooseCreatureTokenToPopulate": "Wähle einen Kreaturspielstein zum Populieren",
     "chooseReturnAsAuraTarget": "Wähle eine bleibende Karte zum Verzaubern",
     "tapUntappedCreatures_one": "Tappe {{count}} ungetappte Kreatur",
     "tapUntappedCreatures_other": "Tappe {{count}} ungetappte Kreaturen",
@@ -1018,6 +1019,12 @@
       "sourceGraveyard": "deinem Friedhof",
       "subtitle_one": "Schicke {{count}} Karte aus {{source}} ins Exil",
       "subtitle_other": "Schicke {{count}} Karten aus {{source}} ins Exil"
+    },
+    "craft": {
+      "title": "Herstellen",
+      "subtitle_one": "Schicke {{count}} Material zum Herstellen ins Exil",
+      "subtitle_other": "Schicke {{count}} Materialien zum Herstellen ins Exil",
+      "subtitleRange": "Schicke {{min}} bis {{count}} Materialien zum Herstellen ins Exil"
     },
     "behold": {
       "title": "Erblicken",

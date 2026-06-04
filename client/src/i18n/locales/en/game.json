@@ -411,6 +411,7 @@
     "chooseNewTarget": "Choose the spell's new target",
     "chooseNewTargetForSpell": "Choose a new target for {{spell}}",
     "chooseCreatureToExplore": "Choose which creature explores next",
+    "chooseCreatureTokenToPopulate": "Choose a creature token to populate",
     "chooseReturnAsAuraTarget": "Choose a permanent to enchant",
     "tapUntappedCreatures_one": "Tap {{count}} untapped creature",
     "tapUntappedCreatures_other": "Tap {{count}} untapped creatures",
@@ -1018,6 +1019,12 @@
       "sourceGraveyard": "your graveyard",
       "subtitle_one": "Exile {{count}} card from {{source}}",
       "subtitle_other": "Exile {{count}} cards from {{source}}"
+    },
+    "craft": {
+      "title": "Craft",
+      "subtitle_one": "Exile {{count}} material to craft",
+      "subtitle_other": "Exile {{count}} materials to craft",
+      "subtitleRange": "Exile {{min}} to {{count}} materials to craft"
     },
     "behold": {
       "title": "Behold",
