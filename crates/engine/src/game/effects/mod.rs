@@ -7315,6 +7315,93 @@ mod tests {
         assert_eq!(state.players[0].hand.len(), 1);
     }
 
+    /// CR 608.2k (issue #2356, God-Pharaoh's Gift): a singular "it"
+    /// anaphor following a token-creating effect binds to the *created token*,
+    /// not the ability's source. The parser lowers "create a token … It gains
+    /// haste until end of turn." to a `GenericEffect { affected: LastCreated }`
+    /// sub_ability; the runtime must grant haste to the new token and leave the
+    /// source untouched. Before the fix the affected was `SelfRef`, so the
+    /// source artifact gained haste while the token did not.
+    #[test]
+    fn token_anaphor_it_gains_haste_targets_created_token_not_source() {
+        let mut state = GameState::new_two_player(42);
+        // Source permanent: a vanilla Bear that creates a copy token of itself.
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source_id).unwrap();
+            s.base_power = Some(2);
+            s.base_toughness = Some(2);
+            s.power = Some(2);
+            s.toughness = Some(2);
+            s.base_card_types = crate::types::card_type::CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Bear".to_string()],
+            };
+            s.card_types = s.base_card_types.clone();
+        }
+
+        // "It gains haste until end of turn" lowers to a GenericEffect whose
+        // static affects the just-created token via LastCreated.
+        let haste_sub = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![StaticDefinition::continuous()
+                    .affected(TargetFilter::LastCreated)
+                    .modifications(vec![ContinuousModification::AddKeyword {
+                        keyword: Keyword::Haste,
+                    }])],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::Any,
+                owner: TargetFilter::Controller,
+                source_filter: None,
+                enters_attacking: false,
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![TargetRef::Object(source_id)],
+            source_id,
+            PlayerId(0),
+        )
+        .sub_ability(haste_sub);
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        crate::game::layers::evaluate_layers(&mut state);
+
+        let token_id = *state
+            .last_created_token_ids
+            .first()
+            .expect("a token should have been created");
+        let token = state.objects.get(&token_id).unwrap();
+        assert!(token.is_token);
+        assert!(
+            token.keywords.contains(&Keyword::Haste),
+            "the created token must gain haste (CR 608.2k anaphor binds to the token)"
+        );
+        // The source artifact/permanent must NOT have gained haste.
+        let source = state.objects.get(&source_id).unwrap();
+        assert!(
+            !source.keywords.contains(&Keyword::Haste),
+            "the source must not gain haste — that was the #2356 misparse"
+        );
+    }
+
     /// Regression (issue #1977, Party Thrasher): "you may discard a card. If you
     /// do, exile the top two cards of your library, then choose one of them."
     /// CR 608.2c + CR 603.7: the discard is a gating action behind the

@@ -1257,6 +1257,32 @@ pub(super) fn parse_subject_application(
                 is_optional: false,
             });
         }
+        // CR 608.2k: A just-created token is the nearest anaphoric
+        // referent, so "it" in a continuation after a token-creating clause binds
+        // to the created token via `TargetFilter::LastCreated` — the same ref the
+        // explicit "the token created this way gains …" anaphor lowers to, and
+        // the runtime-proven mechanism (`last_created_token_ids`) used by suspect,
+        // prepare, and the populate path. The non-object subject set
+        // (`None`/`SelfRef`/`Any` — what `resolve_it_pronoun` collapses to
+        // `SelfRef`) is overridden because the token is a nearer referent than the
+        // source/trigger subject (God-Pharaoh's Gift: "create a token … It gains
+        // haste"). An explicit object subject (mapped to `TriggeringSource`) is
+        // left untouched, and the explicit self-anaphors "~"/"this creature"
+        // resolve to `SelfRef` on a separate path.
+        let token_referent = ctx.prior_token_referent
+            && matches!(
+                ctx.subject,
+                None | Some(TargetFilter::SelfRef) | Some(TargetFilter::Any)
+            );
+        if token_referent {
+            return Some(SubjectApplication {
+                affected: TargetFilter::LastCreated,
+                target: None,
+                multi_target: None,
+                inherits_parent: false,
+                is_optional: false,
+            });
+        }
         return Some(SubjectApplication {
             affected: resolve_it_pronoun(ctx),
             target: None,

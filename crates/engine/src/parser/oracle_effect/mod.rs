@@ -9993,6 +9993,31 @@ fn chain_has_prior_typed_referent(clauses: &[ClauseIr]) -> bool {
     false
 }
 
+/// CR 608.2k: Does an earlier clause in the chain create a token
+/// (`Token` / `CopyTokenOf` / `Populate`)? A just-created token is a valid
+/// anaphoric referent for a later bare pronoun — "Create a 1/1 token. **It**
+/// gains haste until end of turn." (God-Pharaoh's Gift) / "create a token …
+/// **It** gains …". The token-creating effects carry no target slot, so they
+/// are invisible to `chain_has_prior_typed_referent` (whose referent test is a
+/// declared target), which left a singular "it" anaphor defaulting to
+/// `SelfRef` (the source). Recognizing the token creator here lets the
+/// bare-"it" branch in `parse_subject_application` resolve to
+/// `TargetFilter::LastCreated`, the runtime-proven created-token reference
+/// (`last_created_token_ids`) that the explicit "the token created this way
+/// gains …" anaphor also lowers to.
+///
+/// Unlike `chain_has_prior_typed_referent`, this does NOT stop at a conditional
+/// clause: a token created under an "if you do" follow-up (God-Pharaoh's Gift)
+/// is still the referent for the subsequent "it gains haste". Only the bare-"it"
+/// branch consumes this (gated on a non-object subject); the explicit
+/// self-anaphors "~"/"this creature" resolve to `SelfRef` on a separate path and
+/// are unaffected.
+fn chain_has_prior_token_creating_clause(clauses: &[ClauseIr]) -> bool {
+    clauses
+        .iter()
+        .any(|prev| is_token_creating_effect(&prev.parsed.effect))
+}
+
 /// CR 608.2c + CR 601.2a: Does the chain's prior referent come from an explicit
 /// target SELECTION (`Effect::TargetOnly`) rather than an exile/impulse publisher
 /// (`ExileTop`, `ExileFromTopUntil`, `ChangeZone`, token creation)? Emry, Lurker
@@ -15677,6 +15702,12 @@ pub(crate) fn parse_effect_chain_ir(
         };
         let parent_target_available =
             if_you_do_anchor.is_some() || chain_has_prior_typed_referent(&clauses);
+        // CR 608.2k: A just-created token is the nearest anaphoric referent for a
+        // bare "it", overriding even a trigger-source subject (God-Pharaoh's Gift's
+        // "create a token … It gains haste"). Tracked separately from
+        // `parent_target_available` because it must bind through a `SelfRef`
+        // subject, which the latter (gated on `subject.is_none()`) does not.
+        let prior_token_referent = chain_has_prior_token_creating_clause(&clauses);
         // CR 608.2c + CR 601.2a: a strict subset of `parent_target_available`
         // restricted to chosen-target referents (Emry), excluding impulse
         // publishers (Territorial Bruntar's `ExileFromTopUntil`). An "if you
@@ -15739,6 +15770,7 @@ pub(crate) fn parse_effect_chain_ir(
             // disambiguates to `CostPaidObject` (Jhoira of the Ghitu).
             current_ability_exile_cost_zone: ctx.current_ability_exile_cost_zone,
             parent_target_available,
+            prior_token_referent,
             effect_chain_full_lower: ctx.effect_chain_full_lower.clone(),
             parent_target_is_chosen,
             ..Default::default()
@@ -40283,6 +40315,77 @@ mod tests {
                 );
             }
             other => panic!("expected GenericEffect anaphor rewrite, got {other:?}"),
+        }
+    }
+
+    /// CR 608.2k (issue #2356): a bare singular "it" continuation
+    /// after a token-creating clause binds to the created token via
+    /// `LastCreated`, mirroring the explicit "the token gains …" anaphor. The
+    /// "it" surface form is parsed directly into a `GenericEffect` by the subject
+    /// grammar (it does not fall through to the `Unimplemented` rewrite), so this
+    /// pins the subject-grammar path. Before the fix `affected` was `SelfRef`
+    /// (the source), the root cause of God-Pharaoh's Gift granting haste to the
+    /// artifact instead of the created Zombie.
+    #[test]
+    fn bare_it_anaphor_after_token_creator_binds_last_created() {
+        let ability = parse_effect_chain(
+            "create a 1/1 white Soldier creature token. it gains haste until end of turn",
+            AbilityKind::Spell,
+        );
+        assert!(
+            matches!(&*ability.effect, Effect::Token { .. }),
+            "expected Effect::Token, got {:?}",
+            ability.effect
+        );
+        let sub = ability
+            .sub_ability
+            .as_deref()
+            .expect("anaphor sub-ability missing");
+        match &*sub.effect {
+            Effect::GenericEffect {
+                static_abilities, ..
+            } => {
+                assert_eq!(static_abilities.len(), 1);
+                assert_eq!(
+                    static_abilities[0].affected,
+                    Some(TargetFilter::LastCreated),
+                    "bare 'it' after a token creator must bind to the created token, not SelfRef"
+                );
+                assert!(static_abilities[0].modifications.iter().any(|m| matches!(
+                    m,
+                    ContinuousModification::AddKeyword {
+                        keyword: Keyword::Haste,
+                    }
+                )));
+            }
+            other => panic!("expected GenericEffect, got {other:?}"),
+        }
+    }
+
+    /// CR 608.2k guard: without a prior token-creating clause, a bare "it gains …"
+    /// continuation must keep resolving to the source (`SelfRef`) — the fix must
+    /// not divert ordinary self-anaphors to the (empty) created-token set.
+    #[test]
+    fn bare_it_gains_without_token_creator_stays_self_ref() {
+        let ability = parse_effect_chain(
+            "draw a card. it gains haste until end of turn",
+            AbilityKind::Spell,
+        );
+        let sub = ability
+            .sub_ability
+            .as_deref()
+            .expect("continuation sub-ability missing");
+        if let Effect::GenericEffect {
+            static_abilities, ..
+        } = &*sub.effect
+        {
+            assert_eq!(
+                static_abilities[0].affected,
+                Some(TargetFilter::SelfRef),
+                "no token creator in the chain — 'it' must stay SelfRef"
+            );
+        } else {
+            panic!("expected GenericEffect, got {:?}", sub.effect);
         }
     }
 

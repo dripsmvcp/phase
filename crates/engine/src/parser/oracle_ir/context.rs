@@ -106,6 +106,17 @@ pub(crate) struct ParseContext {
     /// `ExileFromTopUntil` referent (Territorial Bruntar) that
     /// `parent_target_available` would otherwise include.
     pub parent_target_is_chosen: bool,
+    /// CR 608.2k: An earlier clause in the current effect chain
+    /// created a token (`Token` / `CopyTokenOf` / `Populate`). A just-created
+    /// token is the nearest anaphoric referent for a bare "it" continuation
+    /// ("Create a 1/1 token. It gains haste until end of turn." — God-Pharaoh's
+    /// Gift), so it binds to `TargetFilter::LastCreated` (the created token at
+    /// runtime) even when `subject` is the trigger source (`SelfRef`). Distinct
+    /// from `parent_target_available`, which is gated on `subject.is_none()` and
+    /// so cannot override a `SelfRef`/`Any` trigger subject.
+    /// The explicit self-anaphors "~"/"this creature" resolve to `SelfRef` on a
+    /// separate path and are unaffected.
+    pub prior_token_referent: bool,
 }
 
 impl ParseContext {
