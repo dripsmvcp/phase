@@ -7633,6 +7633,70 @@ mod tests {
     }
 
     #[test]
+    fn triggered_modal_binds_that_player_to_damaged_player() {
+        // CR 120.3 + CR 109.4: Grenzo, Havoc Raiser — a `DamageDone` trigger whose
+        // body is a modal "choose one —" block. Both modes refer to "that player"
+        // (the player dealt combat damage), so the modal lowering must thread the
+        // trigger's relative-player scope into each mode body. Before the fix the
+        // scope was dropped and "that player controls" / "that player's library"
+        // fell back to the trigger controller (`You`).
+        use crate::types::ability::ControllerRef;
+        let r = parse(
+            "Whenever a creature you control deals combat damage to a player, choose one —\n\
+             • Goad target creature that player controls.\n\
+             • Exile the top card of that player's library. Until end of turn, you may cast that card and you may spend mana as though it were mana of any color to cast that spell.",
+            "Grenzo, Havoc Raiser",
+            &[],
+            &["Legendary", "Creature"],
+            &[],
+        );
+        assert_eq!(r.triggers.len(), 1);
+        let trigger = &r.triggers[0];
+        assert_eq!(trigger.mode, TriggerMode::DamageDone);
+        let execute = trigger
+            .execute
+            .as_ref()
+            .expect("trigger should have execute");
+        assert_eq!(execute.mode_abilities.len(), 2);
+
+        // Mode 1: "Goad target creature that player controls" — the target filter's
+        // controller must be the damaged player, not the trigger controller.
+        let goad_target = execute
+            .mode_abilities
+            .iter()
+            .find_map(|ab| match &*ab.effect {
+                Effect::Goad { target } => Some(target),
+                _ => None,
+            })
+            .expect("expected a Goad mode");
+        match goad_target {
+            TargetFilter::Typed(tf) => assert_eq!(
+                tf.controller,
+                Some(ControllerRef::TargetPlayer),
+                "Goad target must be a creature the damaged player controls, got {tf:?}",
+            ),
+            other => panic!("expected a Typed Goad target, got {other:?}"),
+        }
+
+        // Mode 2: "Exile the top card of that player's library" — the library owner
+        // must resolve to the damaged player (the triggering player), mirroring the
+        // non-modal trigger effect path.
+        let exile_player = execute
+            .mode_abilities
+            .iter()
+            .find_map(|ab| match &*ab.effect {
+                Effect::ExileTop { player, .. } => Some(player),
+                _ => None,
+            })
+            .expect("expected an ExileTop mode");
+        assert_eq!(
+            *exile_player,
+            TargetFilter::TriggeringPlayer,
+            "ExileTop must draw from the damaged player's library, got {exile_player:?}",
+        );
+    }
+
+    #[test]
     fn triggered_modal_labeled_modes_strip_labels_before_effect_parse() {
         let r = parse(
             "At the beginning of your upkeep, choose one that hasn't been chosen —\n• Buffet — Create three Food tokens.\n• See a Show — Create two 2/2 white Performer creature tokens.\n• Play Games — Search your library for a card, put that card into your hand, discard a card at random, then shuffle.\n• Go to Sleep — You lose 15 life. Sacrifice Night Out in Vegas.",

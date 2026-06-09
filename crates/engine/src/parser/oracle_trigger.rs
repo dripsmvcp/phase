@@ -566,6 +566,29 @@ fn condition_introduces_target_player(cond_lower: &str) -> bool {
     false
 }
 
+/// CR 109.4 + CR 115.1 + CR 506.2 + CR 120.3: Derive the relative-player scope a
+/// trigger condition introduces for "that player" anaphora in the trigger's
+/// effect body. The damaged/attacked player (or the damage source's controller,
+/// or the phase-scoped player) becomes the referent of "that player controls" /
+/// "that player's library" inside the effect.
+///
+/// This is the single authority used both by `parse_trigger_condition` (for
+/// plain trigger bodies) and by the triggered-modal lowering path in
+/// `oracle_modal`, so a modal body's modes resolve "that player" identically to
+/// a non-modal body (Grenzo, Havoc Raiser: "Goad target creature that player
+/// controls" / "Exile the top card of that player's library").
+pub(crate) fn relative_player_scope_for_condition(cond_lower: &str) -> Option<ControllerRef> {
+    if condition_introduces_damage_source_controller_player(cond_lower) {
+        Some(ControllerRef::ParentTargetController)
+    } else if condition_introduces_target_player(cond_lower) {
+        Some(ControllerRef::TargetPlayer)
+    } else if condition_introduces_scoped_phase_player(cond_lower) {
+        Some(ControllerRef::ScopedPlayer)
+    } else {
+        None
+    }
+}
+
 fn condition_introduces_damage_source_controller_player(cond_lower: &str) -> bool {
     let input = cond_lower.trim_start();
     let input = alt((
@@ -692,13 +715,7 @@ pub(crate) fn parse_trigger_line_with_index_ir(
 
     // CR 109.4 + CR 115.1 + CR 506.2: Set relative-player scope for
     // TargetPlayer resolution inside the trigger effect body.
-    if condition_introduces_damage_source_controller_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::ParentTargetController);
-    } else if condition_introduces_target_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::TargetPlayer);
-    } else if condition_introduces_scoped_phase_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::ScopedPlayer);
-    }
+    effect_ctx.relative_player_scope = relative_player_scope_for_condition(&cond_lower);
 
     // Parse the effect body
     let effect_for_parse_lower = effect_for_parse.to_lowercase();

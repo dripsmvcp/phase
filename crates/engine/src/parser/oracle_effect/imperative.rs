@@ -5404,12 +5404,15 @@ pub(super) fn parse_imperative_family_ast(
                 ))
                 .parse(rest)
                 {
-                    let (target, _) = parse_target(mass_rest);
+                    // CR 109.4 + CR 115.1: thread ctx so a "that player controls"
+                    // suffix binds to the trigger's relative-player scope (e.g. the
+                    // damaged player) instead of defaulting to the controller.
+                    let (target, _) = parse_target_with_ctx(mass_rest, ctx);
                     return Some(ImperativeFamilyAst::GainKeyword(Effect::GoadAll {
                         target,
                     }));
                 }
-                let (target, _) = parse_target(rest);
+                let (target, _) = parse_target_with_ctx(rest, ctx);
                 Some(ImperativeFamilyAst::GainKeyword(Effect::Goad { target }))
             } else {
                 Some(ImperativeFamilyAst::Goad)
