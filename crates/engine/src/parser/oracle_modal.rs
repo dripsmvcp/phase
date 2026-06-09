@@ -7,8 +7,8 @@ use nom::Parser;
 
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, AdditionalCostPaymentSource, ChoiceType,
-    Effect, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter,
-    ReplacementDefinition, StaticCondition, TargetFilter, TriggerCondition,
+    ControllerRef, Effect, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint,
+    PlayerFilter, ReplacementDefinition, StaticCondition, TargetFilter, TriggerCondition,
 };
 use crate::types::replacements::ReplacementEvent;
 
@@ -19,7 +19,7 @@ use super::oracle_ir::context::ParseContext;
 use super::oracle_nom::condition as nom_condition;
 use super::oracle_nom::primitives::{self as nom_primitives, scan_preceded};
 use super::oracle_static::parse_static_line;
-use super::oracle_trigger::parse_trigger_lines;
+use super::oracle_trigger::{parse_trigger_lines, relative_player_scope_for_condition};
 use super::oracle_util::{parse_mana_symbols, strip_reminder_text};
 use crate::parser::oracle_ir::ast::{ModalHeaderAst, ModeAst, OracleBlockAst};
 
@@ -685,12 +685,20 @@ pub(crate) fn lower_oracle_block(
             // `GenericEffect` with no target, so without this threading the
             // "Pick a Perk" mode emits an unresolvable `ParentTarget`.
             let modal_subject = derive_modal_subject(&triggers);
+            // CR 109.4 + CR 115.1 + CR 608.2i: Derive the "that player" anaphor
+            // scope from the trigger condition (single authority shared with the
+            // non-modal trigger-body parser) so modal mode bodies bind it to the
+            // damaged/attacked/chosen player instead of falling back to the
+            // controller (Grenzo, Havoc Raiser's combat-damage modal).
+            let modal_player_scope =
+                relative_player_scope_for_condition(&trigger_line.to_lowercase());
             let mut modal_ability = build_modal_ability_with_subject(
                 AbilityKind::Spell,
                 &header,
                 &modes,
                 modal_subject,
                 host_self_reference,
+                modal_player_scope,
             );
 
             let execute = match optional_cost {
@@ -921,10 +929,17 @@ fn build_modal_ability_with_subject(
     modes: &[ModeAst],
     subject: Option<TargetFilter>,
     host_self_reference: Option<TargetFilter>,
+    relative_player_scope: Option<ControllerRef>,
 ) -> AbilityDefinition {
     AbilityDefinition::new(kind, modal_marker_effect(header)).with_modal(
         build_modal_choice(header, modes),
-        lower_mode_abilities_with_subject(modes, kind, subject, host_self_reference),
+        lower_mode_abilities_with_subject(
+            modes,
+            kind,
+            subject,
+            host_self_reference,
+            relative_player_scope,
+        ),
     )
 }
 
@@ -1023,7 +1038,7 @@ fn lower_mode_abilities(
     kind: AbilityKind,
     host_self_reference: Option<TargetFilter>,
 ) -> Vec<AbilityDefinition> {
-    lower_mode_abilities_with_subject(modes, kind, None, host_self_reference)
+    lower_mode_abilities_with_subject(modes, kind, None, host_self_reference, None)
 }
 
 /// Variant of `lower_mode_abilities` that threads a trigger subject through
@@ -1040,8 +1055,9 @@ fn lower_mode_abilities_with_subject(
     kind: AbilityKind,
     subject: Option<TargetFilter>,
     host_self_reference: Option<TargetFilter>,
+    relative_player_scope: Option<ControllerRef>,
 ) -> Vec<AbilityDefinition> {
-    lower_mode_abilities_with_scope(modes, kind, subject, None, host_self_reference)
+    lower_mode_abilities_with_scope(modes, kind, subject, relative_player_scope, host_self_reference)
 }
 
 /// Variant of `lower_mode_abilities_with_subject` that additionally seeds
@@ -1059,6 +1075,13 @@ pub(crate) fn lower_mode_abilities_with_scope(
     relative_player_scope: Option<crate::types::ability::ControllerRef>,
     host_self_reference: Option<TargetFilter>,
 ) -> Vec<AbilityDefinition> {
+    // CR 109.4 + CR 115.1 + CR 608.2i: A `Choose one —` modal under a trigger
+    // that introduces a "that player" referent (e.g. "deals combat damage to a
+    // player") must resolve that anaphor inside each mode body exactly as a
+    // non-modal trigger body does. Seed the per-mode context with the trigger's
+    // relative-player scope so mode bodies bind "that player controls" /
+    // "that player's library" to the damaged/attacked player rather than the
+    // ability's controller (Grenzo, Havoc Raiser).
     let mut ctx = ParseContext {
         subject,
         host_self_reference,

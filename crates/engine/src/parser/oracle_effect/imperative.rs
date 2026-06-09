@@ -6542,11 +6542,18 @@ pub(super) fn parse_imperative_family_ast(
                 ))
                 .parse(rest)
                 {
+                    // CR 109.4 + CR 115.1: honor the trigger's relative-player
+                    // scope so "goad all creatures that player controls" binds
+                    // the filter controller to the anaphoric player.
                     let (target, _) = parse_target_with_ctx(mass_rest, ctx);
                     return Some(ImperativeFamilyAst::GainKeyword(Effect::GoadAll {
                         target,
                     }));
                 }
+                // CR 701.15a + CR 109.4: "goad target creature that player
+                // controls" (Grenzo, Havoc Raiser) — parse the target through
+                // the context-aware path so "that player controls" resolves to
+                // the trigger's relative-player scope instead of the controller.
                 let (target, _) = parse_target_with_ctx(rest, ctx);
                 Some(ImperativeFamilyAst::GainKeyword(Effect::Goad { target }))
             } else {

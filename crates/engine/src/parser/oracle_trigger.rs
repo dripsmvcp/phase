@@ -693,6 +693,41 @@ fn condition_introduces_target_player(cond_lower: &str) -> bool {
     false
 }
 
+/// CR 109.4 + CR 115.1 + CR 608.2i: Map a trigger's condition text to the
+/// relative-player anaphor scope its effect body should resolve "that player"
+/// (and the past-tense / "they control" variants) against. Single authority
+/// shared by the inline trigger-body parser and the triggered-modal lowering
+/// path (`oracle_modal::lower_oracle_block`), so a `Choose one —` modal under a
+/// "deals combat damage to a player" trigger binds "that player" to the damaged
+/// player exactly like a non-modal body does (Grenzo, Havoc Raiser).
+pub(crate) fn relative_player_scope_for_condition(cond_lower: &str) -> Option<ControllerRef> {
+    // CR 603.7c: DamageDone triggers ("...deals damage to a player") use
+    // TriggeringPlayer for "that player" in the effect body. This must be
+    // checked BEFORE `condition_introduces_target_player` because both match
+    // "deals [combat] damage to a player", but DamageDone needs TriggeringPlayer
+    // while generic target-player triggers need TargetPlayer.
+    if is_damage_done_trigger_pattern(cond_lower) {
+        Some(ControllerRef::TriggeringPlayer)
+    } else if condition_introduces_damage_source_controller_player(cond_lower) {
+        Some(ControllerRef::ParentTargetController)
+    } else if condition_introduces_defending_player(cond_lower) {
+        // CR 608.2c: Attack triggers use DefendingPlayer (the attacked player
+        // in combat), not TargetPlayer (which requires a player target to be
+        // bound at runtime).
+        Some(ControllerRef::DefendingPlayer)
+    } else if condition_introduces_target_player(cond_lower) {
+        // CR 120.3 + CR 608.2i: "deals [combat] damage to a player" introduces
+        // the damaged player as the "that player" referent.
+        Some(ControllerRef::TargetPlayer)
+    } else if condition_introduces_chosen_player_phase(cond_lower) {
+        Some(ControllerRef::SourceChosenPlayer)
+    } else if condition_introduces_scoped_phase_player(cond_lower) {
+        Some(ControllerRef::ScopedPlayer)
+    } else {
+        None
+    }
+}
+
 fn condition_introduces_damage_source_controller_player(cond_lower: &str) -> bool {
     let input = cond_lower.trim_start();
     let input = alt((
@@ -881,27 +916,7 @@ pub(crate) fn parse_trigger_line_with_index_ir(
 
     // CR 109.4 + CR 115.1 + CR 506.2: Set relative-player scope for
     // TargetPlayer resolution inside the trigger effect body.
-    // CR 603.7c: DamageDone triggers ("...deals damage to a player") use
-    // TriggeringPlayer for "that player" in the effect body. This must be
-    // checked BEFORE `condition_introduces_target_player` because both match
-    // "deals [combat] damage to a player", but DamageDone needs TriggeringPlayer
-    // while generic target-player triggers need TargetPlayer.
-    if is_damage_done_trigger_pattern(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::TriggeringPlayer);
-    } else if condition_introduces_damage_source_controller_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::ParentTargetController);
-    } else if condition_introduces_defending_player(&cond_lower) {
-        // CR 608.2c: Attack triggers use DefendingPlayer (the attacked player
-        // in combat), not TargetPlayer (which requires a player target to be
-        // bound at runtime).
-        effect_ctx.relative_player_scope = Some(ControllerRef::DefendingPlayer);
-    } else if condition_introduces_target_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::TargetPlayer);
-    } else if condition_introduces_chosen_player_phase(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::SourceChosenPlayer);
-    } else if condition_introduces_scoped_phase_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::ScopedPlayer);
-    }
+    effect_ctx.relative_player_scope = relative_player_scope_for_condition(&cond_lower);
     // Snapshot the condition-established scope before body parsing (which may
     // temporarily rebind it via `with_player_scope`) so lowering sees the scope
     // the condition introduced, not a transient nested-clause value.
