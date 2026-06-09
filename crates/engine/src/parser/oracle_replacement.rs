@@ -217,7 +217,7 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         // chain parser.
         let effect_text = extract_replacement_effect(&normalized);
         if let Some(e) = effect_text {
-            def = def.execute(parse_effect_chain(&e, AbilityKind::Spell));
+            def = def.execute(parse_effect_chain(e, AbilityKind::Spell));
         }
         return Some(def);
     }
@@ -271,11 +271,11 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
             // draw-on-decline ability (which would double-draw on accept and
             // shadow the engine's native draw on decline). Strip the lead-in
             // before handing the remainder to `parse_effect_chain`.
-            let (optional_modal_present, effect_after_modal) = strip_optional_instead_lead_in(&e);
+            let (optional_modal_present, effect_after_modal) = strip_optional_instead_lead_in(e);
             if optional_modal_present {
                 def = def.mode(ReplacementMode::Optional { decline: None });
             }
-            def = def.execute(parse_effect_chain(&effect_after_modal, AbilityKind::Spell));
+            def = def.execute(parse_effect_chain(effect_after_modal, AbilityKind::Spell));
         }
         // CR 121.1 + CR 504.1 + CR 614.6: Detect Alhammarret's Archive's
         // "except the first one [you|they] draw in each of [your|their] draw
@@ -327,7 +327,7 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         let mut def =
             ReplacementDefinition::new(ReplacementEvent::GainLife).description(text.to_string());
         if let Some(e) = effect_text {
-            def = def.execute(parse_effect_chain(&e, AbilityKind::Spell));
+            def = def.execute(parse_effect_chain(e, AbilityKind::Spell));
         }
         // CR 614.1a: Parse the subject to determine player scope.
         if nom_primitives::scan_contains(&lower, "an opponent would gain life")
@@ -3851,21 +3851,28 @@ fn parse_color_word(word: &str) -> Option<ManaColor> {
     }
 }
 
-fn extract_replacement_effect(text: &str) -> Option<String> {
-    // Find ", " after "would" or "instead" clause
-    if let Some(effect) = strip_after(text, ", ").map(str::trim) {
-        let lower = effect.to_lowercase();
-        let effect = TextPair::new(effect, &lower)
-            .trim_end()
-            .trim_end_matches('.');
-        let effect = effect
-            .strip_suffix(" instead")
-            .map_or(effect, |trimmed| trimmed.trim_end());
-        if !effect.original.is_empty() {
-            return Some(effect.original.to_string());
-        }
-    }
-    None
+fn extract_replacement_effect(text: &str) -> Option<&str> {
+    // Find ", " after "would" or "instead" clause. The effect is the trailing
+    // slice borrowed from `text`.
+    let effect = strip_after(text, ", ").map(str::trim)?;
+    // All trimming below removes only from the end (whitespace, a trailing
+    // period, a trailing " instead" modal), so the kept region is always a
+    // prefix of `effect`. Compute the kept length on a `TextPair` (whose
+    // `strip_suffix` is case-insensitive via the lowercased side) and re-slice
+    // the original `effect` by that length so the returned `&str` keeps the
+    // original casing and borrows from `text` — no allocation. `TextPair`
+    // itself can't return the slice: it unifies the original and lowercase
+    // lifetimes, tying the result to the local lowercase `String` (see the
+    // lifetime caveat in oracle_util.rs).
+    let lower = effect.to_lowercase();
+    let kept = TextPair::new(effect, &lower)
+        .trim_end()
+        .trim_end_matches('.');
+    let kept = kept
+        .strip_suffix(" instead")
+        .map_or(kept, |trimmed| trimmed.trim_end());
+    let kept = &effect[..kept.original.len()];
+    (!kept.is_empty()).then_some(kept)
 }
 
 /// CR 614.1a + CR 614.6: Strip a leading "you may instead " modal from the
@@ -3877,16 +3884,16 @@ fn extract_replacement_effect(text: &str) -> Option<String> {
 /// Uses a nom `tag` over the lowercased text for dispatch (no `starts_with`),
 /// then peels the matched byte length off the original case-preserving slice
 /// so downstream chain parsing sees the original capitalization.
-fn strip_optional_instead_lead_in(effect_text: &str) -> (bool, String) {
+fn strip_optional_instead_lead_in(effect_text: &str) -> (bool, &str) {
     let lower = effect_text.to_lowercase();
     let strip_result: nom::IResult<&str, (), OracleError<'_>> =
         preceded(tag("you may instead "), nom::combinator::success(())).parse(lower.as_str());
     let Ok((rest_lower, ())) = strip_result else {
-        return (false, effect_text.to_string());
+        return (false, effect_text);
     };
     let offset = lower.len() - rest_lower.len();
     let rest_orig = effect_text[offset..].trim_start();
-    (true, rest_orig.to_string())
+    (true, rest_orig)
 }
 
 #[derive(Clone, Copy)]

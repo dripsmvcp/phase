@@ -237,15 +237,27 @@ fn abundance_decline_falls_through_to_normal_draw() {
             runner.state().waiting_for
         );
     };
-    let decline_idx = candidate_descriptions
-        .iter()
-        .position(|d| d.contains("Decline"))
-        .unwrap_or_else(|| {
-            panic!(
-                "Decline option must be offered for Abundance's optional \
-                 replacement; got candidates={candidate_descriptions:?}"
-            )
-        });
+    // Discriminating assertion (issue #576 item 1): an Optional-mode
+    // replacement surfaces exactly two candidates — the accept branch (labeled
+    // by the replacement's own description) and an explicit "Decline". A
+    // regression that lowered the mode to Mandatory would surface only the
+    // single accept candidate (`p.is_optional == false` ⇒ `candidate_count =
+    // candidates.len()`), so the previous bare `position(|d| d.contains(
+    // "Decline"))` scan did not actually prove the optional surfacing was
+    // reached at runtime. Pin both the count and the Decline slot.
+    assert_eq!(
+        candidate_descriptions.len(),
+        2,
+        "Abundance's optional replacement must surface exactly two candidates \
+         (accept + Decline); a Mandatory-mode regression surfaces only one. \
+         got candidates={candidate_descriptions:?}"
+    );
+    assert_eq!(
+        candidate_descriptions[1], "Decline",
+        "the second candidate must be the explicit Decline branch; \
+         got candidates={candidate_descriptions:?}"
+    );
+    let decline_idx = 1;
     runner
         .act(GameAction::ChooseReplacement { index: decline_idx })
         .expect("decline Abundance's optional replacement");
@@ -271,5 +283,90 @@ fn abundance_decline_falls_through_to_normal_draw() {
         library_after_names,
         library_before_names[1..].to_vec(),
         "decline must NOT shuffle the library — the rest of the deck stays in original order"
+    );
+}
+
+/// CR 614.1a + CR 614.6 (issue #576 item 2): Abundance's "if you would draw a
+/// card" replacement is keyed to its controller, not to the active player. When
+/// the Abundance controller (P0) is made to draw a card during an *opponent's*
+/// turn (active player P1, e.g. a forced "target opponent draws a card" the
+/// opponent resolves against P0), the replacement must still surface for P0 and
+/// replace the draw. This guards the off-turn path: a regression that gated the
+/// draw-replacement on `player_id == active_player` would silently let the
+/// off-turn draw through unmodified.
+#[test]
+fn abundance_replaces_off_turn_draw_for_controller() {
+    let Some(db) = load_db() else {
+        return;
+    };
+
+    let mut runner = scenario_with_abundance_and_library(
+        db,
+        &[
+            "Grizzly Bears",
+            "Hill Giant",
+            "Forest",
+            "Plains",
+            "Mountain",
+        ],
+    );
+
+    // Simulate an opponent's turn: P1 is the active player while P0 (the
+    // Abundance controller) is the one drawing. `scenario_with_abundance_and_library`
+    // builds at PreCombatMain with P0 active; flip the turn pointer to P1 so the
+    // forthcoming P0 draw is genuinely off-turn for the Abundance controller.
+    runner.state_mut().active_player = P1;
+    runner.state_mut().priority_player = P1;
+
+    let hand_before = runner.state().players[0].hand.len();
+    let library_before = runner.state().players[0].library.len();
+
+    // The draw is for P0 (the Abundance controller), resolved during P1's turn.
+    issue_single_draw(&mut runner);
+
+    // The controller-keyed replacement must surface even though P0 is not the
+    // active player (CR 614.1a — replacement scope is the affected player, here
+    // the drawing player P0, regardless of whose turn it is).
+    let WaitingFor::ReplacementChoice { player, .. } = runner.state().waiting_for else {
+        panic!(
+            "expected Abundance's ReplacementChoice to surface for an off-turn \
+             controller draw, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(
+        player, P0,
+        "the off-turn draw replacement must be offered to the drawing Abundance \
+         controller (P0), not the active player (P1)"
+    );
+
+    runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("accept Abundance's optional replacement off-turn");
+    assert_named_choice(&runner, &["Land", "Nonland"]);
+    runner
+        .act(GameAction::ChooseOption {
+            choice: "Land".to_string(),
+        })
+        .expect("choose Land off-turn");
+    runner.advance_until_stack_empty();
+
+    let hand_after_names = hand_card_names(runner.state(), P0);
+
+    // CR 614.6: the off-turn draw is fully replaced — exactly +1 hand card (the
+    // kept land), not +2, and the first land (Forest) is the kept card.
+    assert_eq!(
+        hand_after_names.len(),
+        hand_before + 1,
+        "off-turn accept-and-choose-Land must yield exactly +1 hand card; got {hand_after_names:?}"
+    );
+    assert!(
+        hand_after_names.contains(&"Forest".to_string()),
+        "the first land from the top (Forest) must be kept off-turn; got {hand_after_names:?}"
+    );
+    assert_eq!(
+        runner.state().players[0].library.len(),
+        library_before - 1,
+        "off-turn replacement moves exactly the kept land out of the library"
     );
 }
