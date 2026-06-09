@@ -1762,17 +1762,46 @@ fn build_continuous_clause(
     // which handles "where X is" and "for each" internally.
     let norm_lower = normalized.to_lowercase();
     let norm_tp = TextPair::new(&normalized, &norm_lower);
-    let (without_where, _) = super::strip_trailing_where_x(norm_tp);
+    let (without_where, where_x_expression) = super::strip_trailing_where_x(norm_tp);
     let duration_source = strip_for_each_for_duration(without_where.original);
     let (_, duration) = super::strip_trailing_duration(duration_source);
 
-    let (predicate_text, fallback_duration) = super::strip_trailing_duration(&normalized);
+    // Derive the predicate from the where-X-stripped text so a trailing ", where
+    // X is …" binding is never silently absorbed by the duration matcher
+    // (Xenagos, God of Revels: "+X/+X until end of turn, where X is that
+    // creature's power" — `strip_trailing_duration` greedily eats both phrases
+    // and drops the binding, defaulting the dynamic P/T to the spell-cast
+    // `CostXPaid` so the boost resolves to +0/+0). The binding is re-attached
+    // below for `parse_continuous_modifications`, which strips and binds it.
+    let (predicate_text, fallback_duration) =
+        super::strip_trailing_duration(without_where.original);
     let duration = duration.or(fallback_duration);
 
-    let modifications = parse_continuous_modifications(predicate_text);
+    // CR 107.3i: Re-attach the extracted where-X binding so the dynamic P/T
+    // magnitude resolves it instead of falling back to `CostXPaid`.
+    let modifications_source = match &where_x_expression {
+        Some(expr) => format!(
+            "{}, where x is {expr}",
+            predicate_text.trim_end_matches(['.', ',', ' '])
+        ),
+        None => predicate_text.to_string(),
+    };
+    let mut modifications = parse_continuous_modifications(&modifications_source);
     if modifications.is_empty() {
         return None;
     }
+
+    // CR 613.4c + CR 115.10: A self-referential dynamic P/T magnitude ("where X
+    // is that creature's power" / "its power") names the boosted creature, so it
+    // must follow the layer recipient — a `Demonstrative` / `Anaphoric` /
+    // `CostPaidObject` scope resolves to 0 once the layer system re-evaluates the
+    // continuous grant with no resolving-ability context. Rebind those scopes to
+    // `Recipient` (guarded so a genuine cost/trigger referent that names a
+    // *different* object keeps its scope). This covers both the `Effect::Pump`
+    // snapshot path below and the bundled-keyword `GenericEffect` continuous
+    // static (Xenagos: "gains haste and gets +X/+X ... where X is that
+    // creature's power").
+    rebind_self_referential_dynamic_pt_to_recipient(&mut modifications, &norm_lower);
 
     // CR 702.62b + CR 611.2a + CR 611.2c: A "gains suspend" grant onto an exiled
     // card has no turn-scoped expiry — a card stays suspended (exiled, has suspend,
@@ -1846,6 +1875,107 @@ fn build_continuous_clause(
         optional: false,
         unless_pay: None,
     })
+}
+
+/// CR 613.4c + CR 115.10: Bind a self-referential dynamic P/T magnitude to the
+/// layer-effect **recipient**.
+///
+/// When a continuous P/T grant says "gets +X/+X ... where X is that creature's
+/// power" / "its power", the magnitude refers to the creature receiving the
+/// boost. "that creature's <stat>" / "its <stat>" lower to
+/// `ObjectScope::CostPaidObject` / `Demonstrative` / `Anaphoric`, which resolve
+/// through the resolving ability's effect context — correct for a one-shot
+/// `Effect::Pump` (snapshotted once at resolution against the target), but
+/// **absent** when the layer system re-evaluates a `GenericEffect` continuous
+/// static on later passes, so the magnitude collapses to 0 (Xenagos, God of
+/// Revels — the boost is sealed as a continuous static because it is bundled
+/// with a keyword grant). Rebinding these scopes to `ObjectScope::Recipient`
+/// makes the layer evaluator read each affected creature's own power/toughness
+/// (CR 115.10) — the same scope the animation path already uses for "becomes an
+/// X/X where X is its power".
+///
+/// `predicate_lower` guards the rebind: a genuine cost/trigger referent ("where
+/// X is the sacrificed creature's power") names a *different* object (CR
+/// 608.2k), so when such a participle is present the self-reference assumption
+/// does not hold and the scope is left intact.
+fn rebind_self_referential_dynamic_pt_to_recipient(
+    modifications: &mut [ContinuousModification],
+    predicate_lower: &str,
+) {
+    // CR 608.2k: participle / event referents name the cost-paid or
+    // trigger-condition object, not the boost recipient.
+    const COST_REFERENT_MARKERS: [&str; 8] = [
+        "sacrificed",
+        "exiled",
+        "destroyed",
+        "discarded",
+        "milled",
+        "revealed",
+        "that died",
+        "dealt damage",
+    ];
+    if COST_REFERENT_MARKERS
+        .iter()
+        .any(|marker| nom_primitives::scan_contains(predicate_lower, marker))
+    {
+        return;
+    }
+    for modification in modifications.iter_mut() {
+        match modification {
+            ContinuousModification::AddDynamicPower { value }
+            | ContinuousModification::AddDynamicToughness { value }
+            | ContinuousModification::SetPowerDynamic { value }
+            | ContinuousModification::SetToughnessDynamic { value } => {
+                rebind_demonstrative_object_scope_to_recipient(value);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recurse through a `QuantityExpr`, rebinding `ObjectScope::CostPaidObject` /
+/// `Demonstrative` / `Anaphoric` on the object power / toughness / mana-value
+/// leaves to `ObjectScope::Recipient`. Mirrors the arithmetic-wrapper recursion
+/// used by the counter-placement rebinder so composed magnitudes ("twice that
+/// creature's power", "that creature's toughness plus 1") rebind as a class.
+fn rebind_demonstrative_object_scope_to_recipient(expr: &mut QuantityExpr) {
+    use crate::types::ability::ObjectScope::{Anaphoric, CostPaidObject, Demonstrative, Recipient};
+    match expr {
+        QuantityExpr::Ref { qty } => match qty {
+            QuantityRef::Power {
+                scope: scope @ (CostPaidObject | Demonstrative | Anaphoric),
+            }
+            | QuantityRef::Toughness {
+                scope: scope @ (CostPaidObject | Demonstrative | Anaphoric),
+            }
+            | QuantityRef::ObjectManaValue {
+                scope: scope @ (CostPaidObject | Demonstrative | Anaphoric),
+            } => {
+                *scope = Recipient;
+            }
+            _ => {}
+        },
+        QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
+        | QuantityExpr::Multiply { inner, .. }
+        | QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::UpTo { max: inner } => {
+            rebind_demonstrative_object_scope_to_recipient(inner);
+        }
+        QuantityExpr::Power { exponent, .. } => {
+            rebind_demonstrative_object_scope_to_recipient(exponent);
+        }
+        QuantityExpr::Sum { exprs } => {
+            for expr in exprs.iter_mut() {
+                rebind_demonstrative_object_scope_to_recipient(expr);
+            }
+        }
+        QuantityExpr::Difference { left, right } => {
+            rebind_demonstrative_object_scope_to_recipient(left);
+            rebind_demonstrative_object_scope_to_recipient(right);
+        }
+        QuantityExpr::Fixed { .. } => {}
+    }
 }
 
 /// Strip "for each [clause]" suffix from text so that duration extraction can find
@@ -3861,6 +3991,98 @@ mod tests {
                 mode: StaticMode::CantGainLife
             }
         )));
+    }
+
+    /// CR 613.4c + CR 115.10: Xenagos, God of Revels — "another target creature
+    /// you control gains haste and gets +X/+X until end of turn, where X is that
+    /// creature's power." Because the grant bundles a keyword (haste) with the
+    /// dynamic P/T, it is sealed as a re-evaluated `GenericEffect` continuous
+    /// static rather than a one-shot `Effect::Pump`. The self-referential "that
+    /// creature's power" magnitude must therefore bind to the layer recipient,
+    /// not a resolving-ability referent that is absent on later layer passes
+    /// (which would collapse the boost to +0/+0).
+    #[test]
+    fn continuous_grant_with_keyword_rebinds_self_power_to_recipient() {
+        use crate::types::ability::{ObjectScope, QuantityExpr, QuantityRef};
+
+        let mut ctx = ParseContext::default();
+        let clause = try_parse_subject_continuous_clause(
+            "target creature gains haste and gets +X/+X until end of turn, where X is that creature's power",
+            &mut ctx,
+        )
+        .expect("Xenagos-style continuous boost should parse");
+
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = clause.effect
+        else {
+            panic!(
+                "expected GenericEffect continuous grant, got {:?}",
+                clause.effect
+            );
+        };
+
+        let mods: Vec<&ContinuousModification> = static_abilities
+            .iter()
+            .flat_map(|def| def.modifications.iter())
+            .collect();
+
+        // The keyword grant must still be present alongside the P/T boost.
+        assert!(
+            mods.iter().any(|m| matches!(
+                m,
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Haste
+                }
+            )),
+            "haste grant should survive, got {mods:?}"
+        );
+
+        // The dynamic power/toughness must read the affected creature's own
+        // power via `Recipient` — never the absent `Demonstrative`/`Anaphoric`
+        // referent that resolves to 0 during continuous re-evaluation.
+        let recipient_power = QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: ObjectScope::Recipient,
+            },
+        };
+        assert!(
+            mods.iter().any(|m| matches!(
+                m,
+                ContinuousModification::AddDynamicPower { value } if *value == recipient_power
+            )),
+            "expected AddDynamicPower bound to Recipient power, got {mods:?}"
+        );
+        assert!(
+            mods.iter().any(|m| matches!(
+                m,
+                ContinuousModification::AddDynamicToughness { value }
+                    if matches!(
+                        value,
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::Power { scope: ObjectScope::Recipient }
+                        }
+                    )
+            )),
+            "expected AddDynamicToughness bound to Recipient power, got {mods:?}"
+        );
+        // No self-referential scope should leak through to runtime.
+        assert!(
+            !mods.iter().any(|m| matches!(
+                m,
+                ContinuousModification::AddDynamicPower { value }
+                    | ContinuousModification::AddDynamicToughness { value }
+                    if matches!(
+                        value,
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::Power {
+                                scope: ObjectScope::Demonstrative | ObjectScope::Anaphoric
+                            }
+                        }
+                    )
+            )),
+            "no Demonstrative/Anaphoric P/T scope should remain, got {mods:?}"
+        );
     }
 
     #[test]
