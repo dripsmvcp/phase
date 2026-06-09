@@ -95,6 +95,18 @@ pub(crate) fn parse_static_line_inner(
         return Some(def);
     }
 
+    // --- "(During your turn, )?as long as ~ has [counters], [pronoun]'s a [P/T] [types] [with|and has] [keyword(s)]" ---
+    // Counter-threshold animation (Kaito, Grand Master of Flowers, Gideon, etc.).
+    // Must run BEFORE the inverted "As long as ..." rewrite below: the
+    // "As long as ~ has N counters on him, he's a ..." shape (Grand Master) would
+    // otherwise be swallowed by the generic inverted-continuous path, which cannot
+    // model the fixed-P/T + multi-keyword animation body and silently drops most
+    // of the modifications. This parser is specific (it only matches the
+    // counter-threshold + pronoun-animation shape) so running it first is safe.
+    if let Some(def) = parse_counter_animation_static(tp.lower, tp.original) {
+        return Some(def);
+    }
+
     // CR 611.3a: An inverted static of the form "As long as <condition>, <effect>"
     // is semantically equivalent to the canonical "<effect> as long as <condition>".
     // Rewrite to canonical form and re-dispatch so the existing conditional-continuous
@@ -833,12 +845,6 @@ pub(crate) fn parse_static_line_inner(
                 }])
                 .description(text.to_string()),
         );
-    }
-
-    // --- "During your turn, as long as ~ has [counters], [pronoun]'s a [P/T] [types] and has [keyword]" ---
-    // Compound condition: DuringYourTurn + HasCounters → animation pattern (Kaito, Gideon, etc.)
-    if let Some(def) = parse_compound_turn_counter_animation(tp.lower, tp.original) {
-        return Some(def);
     }
 
     // --- "During your turn, [subject] has/gets ..." ---

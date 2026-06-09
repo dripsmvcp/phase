@@ -351,18 +351,26 @@ pub(crate) fn parse_subject_additive_type_static(text: &str) -> Option<StaticDef
     )
 }
 
-/// Parse compound condition + animation pattern:
-/// "During your turn, as long as ~ has one or more [counter] counters on [pronoun],
-///  [pronoun]'s a [P/T] [types] and has [keyword]"
+/// Parse counter-threshold animation pattern (CR 613.1 continuous self-static):
+/// "(During your turn, )?as long as ~ has [N or more|a|one or more] [counter] counters
+///  on [pronoun], [pronoun]'s a [P/T] [types] [and has|with] [keyword(s)]"
 ///
-/// Produces `StaticCondition::And { DuringYourTurn, HasCounters { .. } }` with
-/// `ContinuousModification` list for type/subtype/P-T/keyword changes.
-pub(crate) fn parse_compound_turn_counter_animation(
-    lower: &str,
-    text: &str,
-) -> Option<StaticDefinition> {
-    // Strip "during your turn, " prefix via nom tag
-    let (rest, _) = tag::<_, _, OracleError<'_>>("during your turn, ")(lower).ok()?;
+/// The optional "During your turn, " timing prefix distinguishes the two
+/// shapes in this class: Kaito, Bane of Nightmares restricts the animation to
+/// its controller's turn, while Grand Master of Flowers / Gideon-style cards
+/// apply whenever the loyalty threshold is met, on any turn.
+///
+/// Produces `StaticCondition::HasCounters { .. }` (threshold only) or, when the
+/// turn prefix is present, `StaticCondition::And { DuringYourTurn, HasCounters }`,
+/// with a `ContinuousModification` list for the type/subtype/P-T/keyword changes
+/// delegated to `parse_animation_modifications` (which already handles fixed P/T,
+/// multi-word subtypes, and both the " with " and " and has " keyword tails).
+pub(crate) fn parse_counter_animation_static(lower: &str, text: &str) -> Option<StaticDefinition> {
+    // Optional "during your turn, " timing prefix.
+    let (rest, during_your_turn) = match tag::<_, _, OracleError<'_>>("during your turn, ")(lower) {
+        Ok((rest, _)) => (rest, true),
+        Err(_) => (lower, false),
+    };
 
     // Strip "as long as " prefix from the remainder
     let (rest, _) = tag::<_, _, OracleError<'_>>("as long as ")(rest).ok()?;
@@ -395,19 +403,26 @@ pub(crate) fn parse_compound_turn_counter_animation(
         return None;
     }
 
+    let counter_condition = StaticCondition::HasCounters {
+        counters,
+        minimum,
+        maximum: None,
+    };
+    // CR 611.2c: the "during your turn" half is a separate functioning gate; when
+    // present, both must hold (compose via `And`). When absent, the loyalty
+    // threshold alone governs.
+    let condition = if during_your_turn {
+        StaticCondition::And {
+            conditions: vec![StaticCondition::DuringYourTurn, counter_condition],
+        }
+    } else {
+        counter_condition
+    };
+
     Some(
         StaticDefinition::continuous()
             .affected(TargetFilter::SelfRef)
-            .condition(StaticCondition::And {
-                conditions: vec![
-                    StaticCondition::DuringYourTurn,
-                    StaticCondition::HasCounters {
-                        counters,
-                        minimum,
-                        maximum: None,
-                    },
-                ],
-            })
+            .condition(condition)
             .modifications(modifications)
             .description(text.to_string()),
     )

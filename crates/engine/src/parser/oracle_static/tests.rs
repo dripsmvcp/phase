@@ -4814,6 +4814,54 @@ fn parse_compound_static_kaito_animation() {
         }));
 }
 
+#[test]
+fn parse_grand_master_of_flowers_loyalty_animation() {
+    // Regression for issue #2363. CR 613.1: Grand Master of Flowers becomes a
+    // 7/7 Dragon God creature with flying and indestructible while it has 7+
+    // loyalty counters. Unlike Kaito there is no "during your turn" restriction,
+    // so the condition is the bare loyalty threshold. Previously only
+    // AddKeyword(Indestructible) survived; the P/T, types, and flying were
+    // dropped because the "As long as ~ has N counters, he's a ..." shape was
+    // swallowed by the generic inverted-continuous path.
+    let text = "As long as ~ has seven or more loyalty counters on him, he's a 7/7 Dragon God creature with flying and indestructible.";
+    let def = parse_static_line(text).unwrap();
+
+    // Bare loyalty threshold — no DuringYourTurn wrapper.
+    assert!(
+        matches!(
+            def.condition,
+            Some(StaticCondition::HasCounters {
+                counters: CounterMatch::OfType(crate::types::counter::CounterType::Loyalty),
+                minimum: 7,
+                ..
+            })
+        ),
+        "expected bare HasCounters(Loyalty, min 7), got {:?}",
+        def.condition
+    );
+
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+
+    let mods = &def.modifications;
+    assert!(mods.contains(&ContinuousModification::SetPower { value: 7 }));
+    assert!(mods.contains(&ContinuousModification::SetToughness { value: 7 }));
+    assert!(mods.contains(&ContinuousModification::AddType {
+        core_type: crate::types::card_type::CoreType::Creature,
+    }));
+    assert!(mods.contains(&ContinuousModification::AddSubtype {
+        subtype: "Dragon".to_string(),
+    }));
+    assert!(mods.contains(&ContinuousModification::AddSubtype {
+        subtype: "God".to_string(),
+    }));
+    assert!(mods.contains(&ContinuousModification::AddKeyword {
+        keyword: Keyword::Flying,
+    }));
+    assert!(mods.contains(&ContinuousModification::AddKeyword {
+        keyword: Keyword::Indestructible,
+    }));
+}
+
 // ── New static routing tests (Steps 4-5) ─────────────────────────────
 
 #[test]
