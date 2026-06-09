@@ -6,9 +6,9 @@ use nom::sequence::{delimited, preceded, terminated};
 use nom::Parser;
 
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, AdditionalCostPaymentSource, ChoiceType, Effect, ModalChoice,
-    ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter, ReplacementDefinition,
-    StaticCondition, TargetFilter, TriggerCondition,
+    AbilityDefinition, AbilityKind, AdditionalCostPaymentSource, ChoiceType, ControllerRef, Effect,
+    ModalChoice, ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter,
+    ReplacementDefinition, StaticCondition, TargetFilter, TriggerCondition,
 };
 use crate::types::replacements::ReplacementEvent;
 
@@ -19,7 +19,7 @@ use super::oracle_ir::context::ParseContext;
 use super::oracle_nom::condition as nom_condition;
 use super::oracle_nom::primitives::{self as nom_primitives, scan_preceded};
 use super::oracle_static::parse_static_line;
-use super::oracle_trigger::parse_trigger_lines;
+use super::oracle_trigger::{parse_trigger_lines, relative_player_scope_for_condition};
 use super::oracle_util::{parse_mana_symbols, strip_reminder_text};
 use crate::parser::oracle_ir::ast::{ModalHeaderAst, ModeAst, OracleBlockAst};
 
@@ -621,11 +621,21 @@ pub(crate) fn lower_oracle_block(
             // `GenericEffect` with no target, so without this threading the
             // "Pick a Perk" mode emits an unresolvable `ParentTarget`.
             let modal_subject = derive_modal_subject(&triggers);
+            // CR 109.4 + CR 115.1 + CR 506.2: Thread the same relative-player
+            // scope the non-modal trigger-body parser derives so "that player"
+            // anaphora in modal mode bodies ("Goad target creature that player
+            // controls", "exile the top card of that player's library") binds to
+            // the event player (the damaged player for a combat-damage trigger)
+            // instead of falling back to `ControllerRef::You`. Without this,
+            // Grenzo, Havoc Raiser's modes affected the source's controller.
+            let relative_player_scope =
+                relative_player_scope_for_condition(&trigger_line.to_lowercase());
             let modal_execute = Box::new(build_modal_ability_with_subject(
                 AbilityKind::Spell,
                 &header,
                 &modes,
                 modal_subject,
+                relative_player_scope,
                 host_self_reference,
             ));
             for trigger in &mut triggers {
@@ -830,11 +840,18 @@ fn build_modal_ability_with_subject(
     header: &ModalHeaderAst,
     modes: &[ModeAst],
     subject: Option<TargetFilter>,
+    relative_player_scope: Option<ControllerRef>,
     host_self_reference: Option<TargetFilter>,
 ) -> AbilityDefinition {
     AbilityDefinition::new(kind, modal_marker_effect(header)).with_modal(
         build_modal_choice(header, modes),
-        lower_mode_abilities_with_subject(modes, kind, subject, host_self_reference),
+        lower_mode_abilities_with_subject(
+            modes,
+            kind,
+            subject,
+            relative_player_scope,
+            host_self_reference,
+        ),
     )
 }
 
@@ -933,7 +950,7 @@ fn lower_mode_abilities(
     kind: AbilityKind,
     host_self_reference: Option<TargetFilter>,
 ) -> Vec<AbilityDefinition> {
-    lower_mode_abilities_with_subject(modes, kind, None, host_self_reference)
+    lower_mode_abilities_with_subject(modes, kind, None, None, host_self_reference)
 }
 
 /// Variant of `lower_mode_abilities` that threads a trigger subject through
@@ -949,10 +966,12 @@ fn lower_mode_abilities_with_subject(
     modes: &[ModeAst],
     kind: AbilityKind,
     subject: Option<TargetFilter>,
+    relative_player_scope: Option<ControllerRef>,
     host_self_reference: Option<TargetFilter>,
 ) -> Vec<AbilityDefinition> {
     let mut ctx = ParseContext {
         subject,
+        relative_player_scope,
         host_self_reference,
         ..Default::default()
     };

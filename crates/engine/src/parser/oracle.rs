@@ -9826,6 +9826,63 @@ mod tests {
         ));
     }
 
+    /// Issue #2346 — Grenzo, Havoc Raiser. A combat-damage trigger whose body
+    /// is a "choose one —" modal must bind "that player" in each mode to the
+    /// damaged player (the trigger's event player), not the source's
+    /// controller. Before the fix the modal mode bodies parsed with no
+    /// relative-player scope, so "Goad target creature that player controls"
+    /// fell back to `ControllerRef::You` and "exile the top card of that
+    /// player's library" fell back to `ParentTarget` — both wrongly affecting
+    /// Grenzo's controller instead of the opponent who took the damage.
+    #[test]
+    fn grenzo_modal_combat_damage_binds_that_player_to_damaged_player() {
+        use crate::types::ability::{ControllerRef, TargetFilter};
+
+        let r = parse(
+            "Whenever a creature you control deals combat damage to a player, choose one —\n• Goad target creature that player controls.\n• Exile the top card of that player's library. Until end of turn, you may cast that card and you may spend mana as though it were mana of any color to cast that spell.",
+            "Grenzo, Havoc Raiser",
+            &[],
+            &["Legendary", "Creature"],
+            &[],
+        );
+        assert_eq!(r.triggers.len(), 1);
+        let trigger = &r.triggers[0];
+        assert_eq!(trigger.mode, TriggerMode::DamageDone);
+
+        let execute = trigger.execute.as_ref().expect("trigger should execute");
+        let modal = execute.modal.as_ref().expect("execute should be modal");
+        assert_eq!(modal.mode_count, 2);
+        assert_eq!(execute.mode_abilities.len(), 2);
+
+        // Mode 1: "Goad target creature that player controls" — the goaded
+        // creature is controlled by the damaged player. `that player controls`
+        // resolves to `ControllerRef::TargetPlayer` (the event-bound player),
+        // NOT `ControllerRef::You`.
+        match &*execute.mode_abilities[0].effect {
+            Effect::Goad { target } => match target {
+                TargetFilter::Typed(tf) => assert_eq!(
+                    tf.controller,
+                    Some(ControllerRef::TargetPlayer),
+                    "goad target must be controlled by the damaged player"
+                ),
+                other => panic!("expected typed goad target, got {other:?}"),
+            },
+            other => panic!("expected Goad effect in mode 1, got {other:?}"),
+        }
+
+        // Mode 2: "Exile the top card of that player's library" — exiles from
+        // the damaged player's library (`TriggeringPlayer`), not the
+        // controller's (`ParentTarget`).
+        match &*execute.mode_abilities[1].effect {
+            Effect::ExileTop { player, .. } => assert_eq!(
+                *player,
+                TargetFilter::TriggeringPlayer,
+                "exile-top must read the damaged player's library"
+            ),
+            other => panic!("expected ExileTop effect in mode 2, got {other:?}"),
+        }
+    }
+
     #[test]
     fn triggered_modal_labeled_modes_strip_labels_before_effect_parse() {
         let r = parse(

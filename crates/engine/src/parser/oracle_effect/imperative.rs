@@ -5983,6 +5983,10 @@ pub(super) fn parse_imperative_family_ast(
         // CR 701.15a: "goad target creature" / "goads target creature" / "goad it"
         "goad" | "goads" => {
             let rest = lower[first_word.len()..].trim();
+            // Original-case remainder, start-aligned (only the leading space
+            // after "goad"/"goads" is trimmed) so `parse_target_with_ctx` sees
+            // the real casing and a faithful trailing remainder.
+            let rest_orig = text[first_word.len()..].trim_start();
             if !rest.is_empty() {
                 if let Ok((mass_rest, _)) = alt((
                     tag::<_, _, OracleError<'_>>("all "),
@@ -5990,12 +5994,22 @@ pub(super) fn parse_imperative_family_ast(
                 ))
                 .parse(rest)
                 {
-                    let (target, _) = parse_target(mass_rest);
+                    // CR 109.4 + CR 115.1: ctx-aware target parser so a "that
+                    // player controls" qualifier resolves against the
+                    // surrounding relative-player scope (e.g. a combat-damage
+                    // trigger's damaged player) instead of defaulting to You.
+                    // The "all "/"each " prefix is ASCII, so the byte length the
+                    // alt consumed maps directly onto the original-case slice.
+                    let prefix_len = rest.len() - mass_rest.len();
+                    let (target, _) = parse_target_with_ctx(&rest_orig[prefix_len..], ctx);
                     return Some(ImperativeFamilyAst::GainKeyword(Effect::GoadAll {
                         target,
                     }));
                 }
-                let (target, _) = parse_target(rest);
+                // CR 109.4 + CR 115.1: ctx-aware so "goad target creature that
+                // player controls" binds the controller to the trigger's
+                // relative-player scope (Grenzo, Havoc Raiser).
+                let (target, _) = parse_target_with_ctx(rest_orig, ctx);
                 Some(ImperativeFamilyAst::GainKeyword(Effect::Goad { target }))
             } else {
                 Some(ImperativeFamilyAst::Goad)
