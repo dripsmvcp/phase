@@ -288,8 +288,9 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
     // `ContinuationAst::EntersTappedAttacking`.
     let lower_trimmed = text.to_lowercase();
     // Single combinator for the whole clause: relative-pronoun variants
-    // factored into one `alt`, shared tail appears once, `eof` anchors the
-    // match at the string's end.
+    // factored into one `alt`, shared tail appears once. The clause returns the
+    // remainder after the attacking phrase so the caller can anchor the match
+    // and splice any trailing clause back in.
     let attacking_clause = |i| -> OracleResult<'_, bool> {
         let (i, _) = alt((
             tag(" that's"),
@@ -303,23 +304,36 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
             value(false, tag(" attacking")),
         ))
         .parse(i)?;
-        let (i, _) = nom::combinator::eof(i)?;
         Ok((i, tapped))
     };
     // Nom parses forward; scan byte positions (only those starting with the
-    // leading space the clause requires) for the first place where the clause
-    // consumes the remainder to EOF. That byte offset is the body length.
+    // leading space the clause requires) for the first place where the
+    // attacking phrase matches AND is followed by an end-of-clause anchor:
+    // either EOF, or a trailing ", where X is …" dynamic-count clause
+    // (CR 107.3i — Anim Pakal, Thousandth Moon's "create X … tokens that are
+    // tapped and attacking, where X is the number of +1/+1 counters on it").
+    // The where-X remainder is preserved and spliced back below so the count
+    // binding still resolves. Records `(phrase_start, after_phrase, tapped)`.
     let entry_clause = (0..lower_trimmed.len()).find_map(|pos| {
-        (lower_trimmed.as_bytes().get(pos) == Some(&b' '))
-            .then(|| {
-                attacking_clause(&lower_trimmed[pos..])
-                    .ok()
-                    .map(|(_, tapped)| (pos, tapped))
-            })
-            .flatten()
+        if lower_trimmed.as_bytes().get(pos) != Some(&b' ') {
+            return None;
+        }
+        let (remainder, tapped) = attacking_clause(&lower_trimmed[pos..]).ok()?;
+        let after_phrase = lower_trimmed.len() - remainder.len();
+        (remainder.is_empty() || remainder.starts_with(", where ")).then_some((
+            pos,
+            after_phrase,
+            tapped,
+        ))
     });
+    let spliced;
     let (text, enters_attacking, enters_tapped_attacking) = match entry_clause {
-        Some((len, tapped)) => (&text[..len], true, tapped),
+        Some((pos, after_phrase, tapped)) => {
+            // Drop only the attacking phrase, keeping any preserved trailing
+            // ", where X is …" clause so the downstream count rebind still sees it.
+            spliced = format!("{}{}", &text[..pos], &text[after_phrase..]);
+            (spliced.as_str(), true, tapped)
+        }
         None => (text, false, false),
     };
     let (mut count, leading_name, mut rest) =
@@ -1030,6 +1044,7 @@ mod tests {
     use super::*;
     use crate::types::ability::{ObjectScope, QuantityExpr, QuantityRef, RoundingMode, TypeFilter};
     use crate::types::card_type::CoreType;
+    use crate::types::counter::CounterType;
 
     #[test]
     fn copy_x_tokens_of_target_parses_variable_count() {
@@ -1077,6 +1092,41 @@ mod tests {
                 .contains(&TypeFilter::Subtype("Clue".to_string())),
             "X must count controlled Clues, got {:?}",
             tf.type_filters
+        );
+    }
+
+    #[test]
+    fn tapped_attacking_tokens_with_trailing_where_x_clause_keep_both() {
+        // CR 508.4 + CR 107.3i: "create X … tokens that are tapped and attacking,
+        // where X is the number of +1/+1 counters on ~" (Anim Pakal, Thousandth
+        // Moon). The trailing ", where X is …" dynamic-count clause must not
+        // suppress the "tapped and attacking" entry modifiers — regression for
+        // the EOF-anchored attacking clause that only matched when the phrase was
+        // the literal end of the string.
+        let txt = "create X 1/1 colorless Gnome artifact creature tokens that are tapped and attacking, where X is the number of +1/+1 counters on ~.";
+        let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
+            .expect("expected Token effect");
+        let Effect::Token {
+            tapped,
+            enters_attacking,
+            count,
+            ..
+        } = effect
+        else {
+            panic!("expected Token effect, got {effect:?}");
+        };
+        assert!(tapped, "Gnome tokens must enter tapped");
+        assert!(enters_attacking, "Gnome tokens must enter attacking");
+        // The dynamic count is still bound by the trailing where-X clause.
+        assert_eq!(
+            count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::CountersOn {
+                    scope: ObjectScope::Source,
+                    counter_type: Some(CounterType::Plus1Plus1),
+                },
+            },
+            "where-X count must survive the spliced attacking clause"
         );
     }
 
