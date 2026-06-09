@@ -106,6 +106,16 @@ pub(crate) struct ParseContext {
     /// `ExileFromTopUntil` referent (Territorial Bruntar) that
     /// `parent_target_available` would otherwise include.
     pub parent_target_is_chosen: bool,
+    /// CR 608.2k + CR 603.7c: A preceding clause in this effect chain created a
+    /// token (Populate / `Token` / `CopyTokenOf`), so a following bare pronoun
+    /// ("it" / "they") anaphor binds to the just-created token(s) via
+    /// `TargetFilter::LastCreated` rather than to the ability source (`SelfRef`).
+    /// Armed per-chunk by `parse_effect_chain_ir` after a token-creating clause;
+    /// consumed only by the bare-pronoun arms of `parse_single_subject` so
+    /// explicit self-references ("~" / "this creature") are unaffected.
+    /// Example: God-Pharaoh's Gift "create a token ... It gains haste" — the
+    /// haste must land on the token, not the Gift artifact.
+    pub created_token_antecedent: bool,
 }
 
 impl ParseContext {

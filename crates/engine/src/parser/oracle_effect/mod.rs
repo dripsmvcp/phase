@@ -14571,6 +14571,17 @@ pub(crate) fn parse_effect_chain_ir(
         if normalized_text.is_empty() {
             continue;
         }
+        // CR 603.7c + CR 608.2k: True when an earlier chunk in this chain created
+        // a token (Populate / `Token` / `CopyTokenOf`), so a bare-pronoun anaphor
+        // ("it" / "they") in this chunk binds to the just-created token via
+        // `LastCreated` instead of the ability source — e.g. God-Pharaoh's Gift
+        // "create a token ... It gains haste". Mirrors the post-pass
+        // `resolve_populated_token_anaphors` antecedent scan; only the
+        // bare-pronoun subject arms read it, so explicit "~" self-references and
+        // independently targeted clauses are unaffected.
+        let created_token_antecedent = clauses
+            .iter()
+            .any(|c| lower::is_token_creating_effect(&c.parsed.effect));
 
         // CR 101.4 + CR 800.4: "Starting with you," — turn-order override for
         // `player_scope` iteration (Join Forces: "Starting with you, each
@@ -15803,6 +15814,9 @@ pub(crate) fn parse_effect_chain_ir(
             parent_target_available,
             effect_chain_full_lower: ctx.effect_chain_full_lower.clone(),
             parent_target_is_chosen,
+            // CR 603.7c + CR 608.2k: a bare-pronoun anaphor in this chunk binds
+            // to a token created by an earlier chunk in the same chain.
+            created_token_antecedent,
             ..Default::default()
         };
         let ctx = &mut chunk_ctx;
@@ -17930,6 +17944,62 @@ mod tests {
     use crate::types::keywords::Keyword;
     use crate::types::mana::{ManaColor, ManaExpiry};
     use crate::types::player::PlayerCounterKind;
+
+    /// CR 603.7c + CR 608.2k (issue #2356): "create a token ... It gains haste"
+    /// — the bare-pronoun "It" must bind to the just-created token, not the
+    /// ability source. Covers the whole "create a token[, then] it gains/gets X"
+    /// class (God-Pharaoh's Gift, and any token-copy creator that grants the
+    /// token a keyword/buff in a following sentence).
+    #[test]
+    fn create_token_then_it_gains_keyword_binds_last_created() {
+        let oracle = "At the beginning of combat on your turn, you may exile a \
+            creature card from your graveyard. If you do, create a token that's a \
+            copy of that card, except it's a 4/4 black Zombie. It gains haste \
+            until end of turn.";
+        let parsed = parse_oracle_text(
+            oracle,
+            "God-Pharaoh's Gift",
+            &[],
+            &["Artifact".to_string()],
+            &[],
+        );
+        let trigger = parsed.triggers.first().expect("ETB/phase trigger parses");
+        // Walk the chained ability for the AddKeyword(Haste) GenericEffect and
+        // assert it targets the created token via LastCreated, not SelfRef.
+        fn find_haste_grant(
+            def: &crate::types::ability::AbilityDefinition,
+        ) -> Option<TargetFilter> {
+            if let Effect::GenericEffect {
+                static_abilities,
+                target,
+                ..
+            } = &*def.effect
+            {
+                let grants_haste = static_abilities.iter().any(|s| {
+                    s.modifications.iter().any(|m| {
+                        matches!(
+                            m,
+                            ContinuousModification::AddKeyword {
+                                keyword: Keyword::Haste,
+                                ..
+                            }
+                        )
+                    })
+                });
+                if grants_haste {
+                    return target.clone();
+                }
+            }
+            def.sub_ability.as_deref().and_then(find_haste_grant)
+        }
+        let def = trigger.execute.as_deref().expect("trigger has an ability");
+        let haste_target = find_haste_grant(def).expect("a Haste grant exists in the chain");
+        assert_eq!(
+            haste_target,
+            TargetFilter::LastCreated,
+            "haste must be granted to the created token (LastCreated), not the source"
+        );
+    }
 
     #[test]
     fn infer_origin_zone_handles_top_of_your_library() {

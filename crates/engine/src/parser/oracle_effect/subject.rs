@@ -750,6 +750,22 @@ fn parse_block_grant_duration(input: &str) -> OracleResult<'_, Option<Duration>>
     .parse(input)
 }
 
+/// CR 603.7c + CR 608.2k: Subject application for a bare pronoun ("it" / "they")
+/// whose antecedent is a token created earlier in the same effect chain. Both
+/// `affected` and `target` are `LastCreated` so the produced effect (a
+/// `GenericEffect` keyword grant, a bounce, a sacrifice, …) binds to the
+/// just-created token(s) at resolution, mirroring the `LastCreated` rewrite the
+/// post-pass applies to "the token created this way" phrasing.
+fn last_created_token_subject() -> SubjectApplication {
+    SubjectApplication {
+        affected: TargetFilter::LastCreated,
+        target: Some(TargetFilter::LastCreated),
+        multi_target: None,
+        inherits_parent: false,
+        is_optional: false,
+    }
+}
+
 pub(super) fn parse_subject_application(
     subject: &str,
     ctx: &mut ParseContext,
@@ -1248,6 +1264,13 @@ pub(super) fn parse_subject_application(
     // typed object referent. Standalone clause parsing leaves it false, so
     // "it connives" remains self-referential instead of inventing ParentTarget.
     if lower == "it" {
+        // CR 603.7c + CR 608.2k: A preceding token-creating clause makes "it"
+        // an anaphor for the just-created token (God-Pharaoh's Gift "create a
+        // token ... It gains haste"), not the ability source. This binds via
+        // `LastCreated` and outranks the `parent_target_available` rung.
+        if ctx.created_token_antecedent {
+            return Some(last_created_token_subject());
+        }
         if ctx.subject.is_none() && ctx.parent_target_available {
             return Some(SubjectApplication {
                 affected: TargetFilter::ParentTarget,
@@ -1270,6 +1293,11 @@ pub(super) fn parse_subject_application(
     // subjects like "an opponent") or the triggering source (for object subjects).
     // Outside trigger context: anaphoric reference to previously mentioned objects.
     if lower == "they" {
+        // CR 603.7c + CR 608.2k: "create [N] tokens ... They gain haste" — the
+        // plural anaphor binds to the just-created tokens via `LastCreated`.
+        if ctx.created_token_antecedent {
+            return Some(last_created_token_subject());
+        }
         return Some(SubjectApplication {
             affected: resolve_they_pronoun(ctx),
             target: None,
