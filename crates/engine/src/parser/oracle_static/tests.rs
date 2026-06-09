@@ -14767,3 +14767,85 @@ fn crew_contribution_power_and_toughness_modifiers_parse() {
         defs[0].modifications
     );
 }
+
+/// CR 611.3a + CR 613.1: "As long as enchanted creature is <color>, it gets
+/// +N/+N and has <keyword>" must narrow the AFFECTED enchanted creature by the
+/// color (like the legendary form), not bind the grant to the Aura itself with
+/// a global `IsPresent` gate. Regression for Shield of the Oversoul (#2674),
+/// whose two color-gated grants previously did nothing on the enchanted
+/// creature. Building-block test: covers the whole "enchanted creature is
+/// <predicate>" class, of which the Oversoul cycle is one member.
+#[test]
+fn static_as_long_as_enchanted_creature_is_color_grants_to_enchanted_creature() {
+    for (line, color, keyword) in [
+        (
+            "As long as enchanted creature is green, it gets +1/+1 and has indestructible.",
+            ManaColor::Green,
+            Keyword::Indestructible,
+        ),
+        (
+            "As long as enchanted creature is white, it gets +1/+1 and has flying.",
+            ManaColor::White,
+            Keyword::Flying,
+        ),
+    ] {
+        let def = parse_static_line(line).unwrap_or_else(|| panic!("should parse: {line}"));
+        assert_eq!(def.mode, StaticMode::Continuous, "{line}");
+        // Affected = the enchanted creature, narrowed by color — not SelfRef.
+        assert_eq!(
+            def.affected,
+            Some(TargetFilter::Typed(TypedFilter::creature().properties(
+                vec![FilterProp::EnchantedBy, FilterProp::HasColor { color }]
+            ))),
+            "{line}"
+        );
+        // The color belongs to the affected filter, not a global IsPresent gate.
+        assert_eq!(def.condition, None, "{line}");
+        assert!(
+            def.modifications
+                .contains(&ContinuousModification::AddPower { value: 1 }),
+            "{line}: {:?}",
+            def.modifications
+        );
+        assert!(
+            def.modifications
+                .contains(&ContinuousModification::AddToughness { value: 1 }),
+            "{line}: {:?}",
+            def.modifications
+        );
+        assert!(
+            def.modifications
+                .contains(&ContinuousModification::AddKeyword { keyword }),
+            "{line}: {:?}",
+            def.modifications
+        );
+    }
+}
+
+/// CR 611.3a + CR 613.1: the generalized attached-subject predicate also covers
+/// type/subtype narrowing ("As long as enchanted creature is an artifact, …"),
+/// proving the fix is class-level rather than another color-only special case.
+#[test]
+fn static_as_long_as_enchanted_creature_is_type_grants_to_enchanted_creature() {
+    let def = parse_static_line(
+        "As long as enchanted creature is an artifact, it gets +1/+1 and has trample.",
+    )
+    .expect("should parse type-gated attached-subject grant");
+    assert_eq!(def.mode, StaticMode::Continuous);
+    assert_eq!(def.condition, None);
+    let affected = def.affected.expect("affected");
+    let TargetFilter::Typed(tf) = affected else {
+        panic!("expected typed affected filter, got {affected:?}");
+    };
+    assert!(tf.properties.contains(&FilterProp::EnchantedBy));
+    assert!(tf.type_filters.contains(&TypeFilter::Artifact));
+    assert!(def
+        .modifications
+        .contains(&ContinuousModification::AddPower { value: 1 }));
+    assert!(def.modifications.iter().any(|m| matches!(
+        m,
+        ContinuousModification::AddKeyword {
+            keyword: Keyword::Trample
+        }
+    )));
+}

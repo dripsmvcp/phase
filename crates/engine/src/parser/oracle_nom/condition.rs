@@ -796,6 +796,30 @@ fn parse_attached_object_is_filter_condition(input: &str) -> OracleResult<'_, St
     Ok((rest, condition))
 }
 
+/// CR 611.3a + CR 613.1: Parse an affirmative `"enchanted/equipped <subject> is
+/// <predicate>"` clause into the merged attached-subject `TargetFilter` —
+/// subject type + attachment prop (`EnchantedBy`/`EquippedBy`) + the
+/// predicate's own color / supertype / type props (`" or "`-disjunctions fold
+/// to `TargetFilter::Or`).
+///
+/// Unlike [`parse_attached_object_is_filter_condition`], which yields a global
+/// `IsPresent` *gate*, this returns the narrowed subject filter so an inverted
+/// attached-subject grant (`"As long as enchanted creature is green, it gets
+/// +1/+1 and has indestructible"`) can scope the *affected* enchanted/equipped
+/// object — the anthem applies to that object while it matches, re-evaluated
+/// continuously (CR 613.1) — rather than mis-binding the grant to the Aura
+/// itself. Affirmative only: a negated copula (`"isn't green"`) is a gating
+/// condition, not a subject-narrowing predicate, so it is rejected here and
+/// left to the condition path. `tag("is ")` cannot match the `"isn't "` /
+/// `"is not "` forms (no trailing space after `"is"` in `"isn't"`).
+pub(crate) fn parse_attached_subject_is_predicate_filter(
+    input: &str,
+) -> OracleResult<'_, TargetFilter> {
+    let (rest, subject) = parse_attached_condition_subject(input)?;
+    let (rest, _) = tag("is ").parse(rest)?;
+    parse_attached_predicate_filter(rest, &subject)
+}
+
 /// Shared subject dispatcher for source-referential predicates.
 ///
 /// Consumes `"<subject> "` — the trailing `"is"` / `"isn't"` is dispatched by the

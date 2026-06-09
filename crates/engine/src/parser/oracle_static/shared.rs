@@ -272,7 +272,7 @@ pub(crate) fn try_parse_inverted_attached_subject_grant(
 ) -> Option<StaticDefinition> {
     let condition_lower = split.condition_text.to_lowercase();
     let condition_tp = TextPair::new(&split.condition_text, &condition_lower);
-    let affected = parse_attached_subject_is_legendary(&condition_tp)?;
+    let affected = parse_attached_subject_is_predicate(&condition_tp)?;
 
     let effect_lower = split.effect_text.to_lowercase();
     let effect_tp = TextPair::new(&split.effect_text, &effect_lower);
@@ -281,30 +281,28 @@ pub(crate) fn try_parse_inverted_attached_subject_grant(
     parse_continuous_gets_has(predicate.original, affected, description)
 }
 
-pub(crate) fn parse_attached_subject_is_legendary(
+/// CR 611.3a + CR 613.1: Resolve an attached-subject grant's affected filter
+/// from an `"enchanted/equipped <subject> is <predicate>"` condition clause.
+///
+/// Delegates to the shared `nom_condition` combinator so EVERY predicate the
+/// attached-condition grammar already understands — color (`"is green"`,
+/// Oversoul cycle), supertype (`"is legendary"`), type/subtype (`"is an
+/// artifact"`, `"is a Zombie"`), and `" or "`-disjunctions — narrows the
+/// affected enchanted/equipped object uniformly. Previously this matched only
+/// the literal `"creature is legendary"`, so color- and type-gated Auras fell
+/// through to the generic conditional path and mis-bound the grant to the Aura
+/// itself (a `SelfRef` affected with a global `IsPresent` gate) instead of to
+/// the enchanted creature. Requires the clause to be fully consumed so partial
+/// predicates do not silently narrow.
+pub(crate) fn parse_attached_subject_is_predicate(
     condition: &TextPair<'_>,
 ) -> Option<TargetFilter> {
-    let (rest, attachment_prop) = if let Some(rest) = nom_tag_tp(condition, "equipped ") {
-        (rest, FilterProp::EquippedBy)
-    } else {
-        (
-            nom_tag_tp(condition, "enchanted ")?,
-            FilterProp::EnchantedBy,
-        )
-    };
-    let rest = nom_tag_tp(&rest, "creature is legendary")?;
-    if !rest.original.trim().is_empty() {
+    let (rest, affected) =
+        nom_condition::parse_attached_subject_is_predicate_filter(condition.lower).ok()?;
+    if !rest.trim().is_empty() {
         return None;
     }
-
-    Some(TargetFilter::Typed(TypedFilter::creature().properties(
-        vec![
-            attachment_prop,
-            FilterProp::HasSupertype {
-                value: Supertype::Legendary,
-            },
-        ],
-    )))
+    Some(affected)
 }
 
 pub(crate) fn target_filter_is_your_graveyard(filter: &TargetFilter) -> bool {
