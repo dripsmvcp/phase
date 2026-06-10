@@ -4513,6 +4513,18 @@ fn resolve_chain_body(
     // This allows sub-abilities like "its controller gains life" to access the object
     // targeted by the parent (e.g. the exiled creature in Swords to Plowshares).
     if let Some(ref sub) = ability.sub_ability {
+        // CR 613.1 + CR 608.2c: A sequential sub-instruction resolves against the
+        // game state as it stands after the parent instruction. Continuous-effect
+        // characteristics the parent changed (e.g. a +1/+1 counter feeding power in
+        // layer 7c, CR 613.4c) are only marked dirty when applied — they are not
+        // re-derived into `obj.power`/`obj.toughness` until layers flush. Flush any
+        // pending re-evaluation now so the sub's condition and effect (and dynamic
+        // `QuantityRef::Power`/`Toughness` reads) see the post-parent board, not a
+        // stale snapshot. `flush_layers` is a no-op when nothing is dirty.
+        // Molten-Core Maestro: "put a +1/+1 counter on this creature. … add an
+        // amount of {R} equal to this creature's power" must add the post-counter
+        // power, not the pre-counter power.
+        crate::game::layers::flush_layers(state);
         // Check if the sub_ability has a condition that gates its execution.
         // Casting-time conditions are evaluated against the parent's SpellContext.
         if let Some(ref condition) = sub.condition {
@@ -7317,6 +7329,81 @@ mod tests {
         assert_eq!(state.players[1].life, 18);
         // Controller drew a card
         assert_eq!(state.players[0].hand.len(), 1);
+    }
+
+    /// Regression (issue #2384, Molten-Core Maestro): a `SequentialSibling`
+    /// whose dynamic quantity reads the source's power must see the board AFTER
+    /// the parent instruction resolved. CR 613.1 + CR 613.4c + CR 608.2c: "put a
+    /// +1/+1 counter on this creature. … add an amount of {R} equal to this
+    /// creature's power" resolves the second instruction against the post-counter
+    /// power (5), not the pre-counter snapshot (4). The counter only marks the
+    /// layer system dirty when applied; the chain walker must flush the layer-7c
+    /// P/T re-derivation before the sibling reads `QuantityRef::Power`. Damage is
+    /// used as a readily-asserted proxy for the mana production.
+    #[test]
+    fn sequential_sibling_reads_power_after_parent_counter() {
+        use crate::types::ability::ObjectScope;
+        let mut state = GameState::new_two_player(42);
+
+        // A 4/4 creature controlled by P0 — the source of the chain.
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Molten-Core Maestro".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.base_power = Some(4);
+            obj.base_toughness = Some(4);
+            obj.power = Some(4);
+            obj.toughness = Some(4);
+        }
+
+        // Sibling: deal damage to P1 equal to the source's CURRENT power.
+        let mut sub = ResolvedAbility::new(
+            Effect::DealDamage {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: ObjectScope::Source,
+                    },
+                },
+                target: TargetFilter::Any,
+                damage_source: None,
+            },
+            vec![TargetRef::Player(PlayerId(1))],
+            creature,
+            PlayerId(0),
+        );
+        sub.sub_link = SubAbilityLink::SequentialSibling;
+
+        // Parent: put a +1/+1 counter on the source, then the sibling.
+        let ability = ResolvedAbility::new(
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::SelfRef,
+            },
+            vec![],
+            creature,
+            PlayerId(0),
+        )
+        .sub_ability(sub);
+
+        let mut events = Vec::new();
+        let result = resolve_ability_chain(&mut state, &ability, &mut events, 0);
+        assert!(result.is_ok());
+
+        // Counter applied: power is re-derived to 5.
+        assert_eq!(state.objects.get(&creature).unwrap().power, Some(5));
+        // Damage equals POST-counter power (5), not the pre-counter 4 → 20 - 5.
+        assert_eq!(
+            state.players[1].life, 15,
+            "CR 613.1: the sibling must read power after the parent's +1/+1 counter"
+        );
     }
 
     /// Regression (issue #1977, Party Thrasher): "you may discard a card. If you
