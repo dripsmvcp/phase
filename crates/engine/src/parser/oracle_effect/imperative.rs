@@ -5990,12 +5990,19 @@ pub(super) fn parse_imperative_family_ast(
                 ))
                 .parse(rest)
                 {
-                    let (target, _) = parse_target(mass_rest);
+                    // CR 109.4 + CR 115.1 (#2346): thread the relative-player
+                    // scope so "goad each creature that player controls" binds
+                    // "that player" to the event-referenced player, not You.
+                    let (target, _) = parse_target_with_ctx(mass_rest, ctx);
                     return Some(ImperativeFamilyAst::GainKeyword(Effect::GoadAll {
                         target,
                     }));
                 }
-                let (target, _) = parse_target(rest);
+                // CR 109.4 + CR 115.1 (#2346 Grenzo, Havoc Raiser): "goad target
+                // creature that player controls" — resolve "that player" against
+                // the trigger's relative-player scope rather than dropping it via
+                // the context-free `parse_target`.
+                let (target, _) = parse_target_with_ctx(rest, ctx);
                 Some(ImperativeFamilyAst::GainKeyword(Effect::Goad { target }))
             } else {
                 Some(ImperativeFamilyAst::Goad)

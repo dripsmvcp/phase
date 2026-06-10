@@ -684,6 +684,32 @@ fn condition_introduces_damage_source_controller_player(cond_lower: &str) -> boo
     )
 }
 
+/// CR 109.4 + CR 115.1 + CR 506.2: Map a trigger condition to the relative
+/// player scope that anaphoric "that player ..." references in the trigger's
+/// effect body resolve against. Single authority shared by the plain trigger
+/// body parser and the triggered-modal lowering path (`oracle_modal.rs`) so a
+/// modal mode ("choose one — • Goad target creature that player controls")
+/// binds "that player" to the same player as the equivalent non-modal trigger
+/// instead of falling back to `ControllerRef::You` (Grenzo, Havoc Raiser).
+pub(crate) fn relative_player_scope_for_condition(cond_lower: &str) -> Option<ControllerRef> {
+    if condition_introduces_damage_source_controller_player(cond_lower) {
+        Some(ControllerRef::ParentTargetController)
+    } else if condition_introduces_defending_player(cond_lower) {
+        // CR 608.2c: Attack triggers use DefendingPlayer (the attacked player
+        // in combat), not TargetPlayer (which requires a player target to be
+        // bound at runtime).
+        Some(ControllerRef::DefendingPlayer)
+    } else if condition_introduces_target_player(cond_lower) {
+        Some(ControllerRef::TargetPlayer)
+    } else if condition_introduces_chosen_player_phase(cond_lower) {
+        Some(ControllerRef::SourceChosenPlayer)
+    } else if condition_introduces_scoped_phase_player(cond_lower) {
+        Some(ControllerRef::ScopedPlayer)
+    } else {
+        None
+    }
+}
+
 /// Parse a full trigger line into a TriggerDefinition.
 /// Input: a line starting with "When", "Whenever", or "At".
 /// The card_name is used for self-reference substitution.
@@ -791,21 +817,8 @@ pub(crate) fn parse_trigger_line_with_index_ir(
     };
 
     // CR 109.4 + CR 115.1 + CR 506.2: Set relative-player scope for
-    // TargetPlayer resolution inside the trigger effect body.
-    if condition_introduces_damage_source_controller_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::ParentTargetController);
-    } else if condition_introduces_defending_player(&cond_lower) {
-        // CR 608.2c: Attack triggers use DefendingPlayer (the attacked player
-        // in combat), not TargetPlayer (which requires a player target to be
-        // bound at runtime).
-        effect_ctx.relative_player_scope = Some(ControllerRef::DefendingPlayer);
-    } else if condition_introduces_target_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::TargetPlayer);
-    } else if condition_introduces_chosen_player_phase(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::SourceChosenPlayer);
-    } else if condition_introduces_scoped_phase_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::ScopedPlayer);
-    }
+    // anaphoric "that player ..." resolution inside the trigger effect body.
+    effect_ctx.relative_player_scope = relative_player_scope_for_condition(&cond_lower);
     // Snapshot the condition-established scope before body parsing (which may
     // temporarily rebind it via `with_player_scope`) so lowering sees the scope
     // the condition introduced, not a transient nested-clause value.
