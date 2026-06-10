@@ -6,9 +6,9 @@ use nom::sequence::{delimited, preceded, terminated};
 use nom::Parser;
 
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, AdditionalCostPaymentSource, ChoiceType, Effect, ModalChoice,
-    ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter, ReplacementDefinition,
-    StaticCondition, TargetFilter, TriggerCondition,
+    AbilityDefinition, AbilityKind, AdditionalCostPaymentSource, ChoiceType, ControllerRef, Effect,
+    ModalChoice, ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter,
+    ReplacementDefinition, StaticCondition, TargetFilter, TriggerCondition,
 };
 use crate::types::replacements::ReplacementEvent;
 
@@ -621,11 +621,23 @@ pub(crate) fn lower_oracle_block(
             // `GenericEffect` with no target, so without this threading the
             // "Pick a Perk" mode emits an unresolvable `ParentTarget`.
             let modal_subject = derive_modal_subject(&triggers);
+            // CR 109.4 + CR 608.2c: Thread the trigger condition's relative-player
+            // scope into the modal mode bodies so a `"that player"` anaphor inside
+            // a mode binds to the event-context player (the damaged player for a
+            // "deals combat damage to a player" trigger), not an unbound
+            // `ParentTarget`. Grenzo, Havoc Raiser ("Goad target creature that
+            // player controls. / Exile the top card of that player's library.") is
+            // the canonical case. Mirrors the single-line trigger path, which
+            // already threads this scope via `derive_trigger_relative_player_scope`.
+            let relative_player_scope = super::oracle_trigger::derive_trigger_relative_player_scope(
+                &trigger_line.to_lowercase(),
+            );
             let modal_execute = Box::new(build_modal_ability_with_subject(
                 AbilityKind::Spell,
                 &header,
                 &modes,
                 modal_subject,
+                relative_player_scope,
                 host_self_reference,
             ));
             for trigger in &mut triggers {
@@ -830,11 +842,18 @@ fn build_modal_ability_with_subject(
     header: &ModalHeaderAst,
     modes: &[ModeAst],
     subject: Option<TargetFilter>,
+    relative_player_scope: Option<ControllerRef>,
     host_self_reference: Option<TargetFilter>,
 ) -> AbilityDefinition {
     AbilityDefinition::new(kind, modal_marker_effect(header)).with_modal(
         build_modal_choice(header, modes),
-        lower_mode_abilities_with_subject(modes, kind, subject, host_self_reference),
+        lower_mode_abilities_with_subject(
+            modes,
+            kind,
+            subject,
+            relative_player_scope,
+            host_self_reference,
+        ),
     )
 }
 
@@ -933,13 +952,19 @@ fn lower_mode_abilities(
     kind: AbilityKind,
     host_self_reference: Option<TargetFilter>,
 ) -> Vec<AbilityDefinition> {
-    lower_mode_abilities_with_subject(modes, kind, None, host_self_reference)
+    lower_mode_abilities_with_subject(modes, kind, None, None, host_self_reference)
 }
 
 /// Variant of `lower_mode_abilities` that threads a trigger subject through
 /// mode-body parsing so anaphoric pronouns ("that creature") resolve against
 /// the triggering object (CR 608.2k + CR 301.5a). When `subject` is `None`,
 /// behavior is identical to `lower_mode_abilities`.
+///
+/// CR 109.4 + CR 608.2c: `relative_player_scope` threads the trigger
+/// condition's event-context player (e.g. `TargetPlayer` = the damaged player of
+/// a "deals combat damage to a player" trigger) so a `"that player"` anaphor in
+/// a mode body binds to it instead of an unbound `ParentTarget`. `None` leaves
+/// the default `You`/`ParentTarget` semantics.
 ///
 /// CR 303.4 + CR 702.103: `host_self_reference` carries the enclosing card's
 /// typed attachment-host self-reference so a `"that creature"` copy-token
@@ -949,10 +974,12 @@ fn lower_mode_abilities_with_subject(
     modes: &[ModeAst],
     kind: AbilityKind,
     subject: Option<TargetFilter>,
+    relative_player_scope: Option<ControllerRef>,
     host_self_reference: Option<TargetFilter>,
 ) -> Vec<AbilityDefinition> {
     let mut ctx = ParseContext {
         subject,
+        relative_player_scope,
         host_self_reference,
         ..Default::default()
     };
@@ -1449,6 +1476,86 @@ mod tests {
                 mode.effect
             );
         }
+    }
+
+    // ---- Grenzo, Havoc Raiser (#2346) — "that player" in a triggered modal ----
+
+    const GRENZO_ORACLE: &str = "Whenever a creature you control deals combat damage to a player, choose one —\n\
+• Goad target creature that player controls.\n\
+• Exile the top card of that player's library. Until end of turn, you may cast that card and you may spend mana as though it were mana of any color to cast that spell.";
+
+    #[test]
+    fn grenzo_modal_that_player_binds_to_damaged_player() {
+        // CR 109.4 + CR 608.2c: In a "deals combat damage to a player" trigger,
+        // "that player" refers to the *damaged* player. The triggered-modal
+        // parser must thread the trigger condition's relative-player scope into
+        // the mode bodies; without it, both modes mis-bound "that player" to the
+        // controller (`You` / `ParentTarget`).
+        let parsed = parse_oracle_text(GRENZO_ORACLE, "Grenzo, Havoc Raiser", &[], &[], &[]);
+        assert_eq!(
+            parsed.triggers.len(),
+            1,
+            "expected one combat-damage trigger"
+        );
+        let trigger = &parsed.triggers[0];
+        assert_eq!(trigger.mode, TriggerMode::DamageDone);
+        let execute = trigger.execute.as_deref().expect("trigger execute body");
+        assert_eq!(execute.mode_abilities.len(), 2, "two modes");
+
+        // Mode 1 — "Goad target creature that player controls": the goaded
+        // creature's controller is the damaged player, surfaced as a companion
+        // player target (ControllerRef::TargetPlayer), NOT `You`.
+        let Effect::Goad { target } = &*execute.mode_abilities[0].effect else {
+            panic!(
+                "expected Goad mode, got {:?}",
+                execute.mode_abilities[0].effect
+            );
+        };
+        let TargetFilter::Typed(typed) = target else {
+            panic!("expected typed goad target, got {target:?}");
+        };
+        assert_eq!(
+            typed.controller,
+            Some(ControllerRef::TargetPlayer),
+            "goad target must be controlled by the damaged player, not the controller"
+        );
+
+        // Mode 2 — "Exile the top card of that player's library": the library
+        // owner is the damaged player (TriggeringPlayer), not the controller.
+        let Effect::ExileTop { player, .. } = &*execute.mode_abilities[1].effect else {
+            panic!(
+                "expected ExileTop mode, got {:?}",
+                execute.mode_abilities[1].effect
+            );
+        };
+        assert_eq!(
+            *player,
+            TargetFilter::TriggeringPlayer,
+            "exiled card's library owner must be the damaged player"
+        );
+    }
+
+    #[test]
+    fn flat_combat_damage_goad_binds_that_player_controls_to_target_player() {
+        // CR 109.4 + CR 701.15a: the Goad imperative now threads the parse
+        // context, so "that player controls" in a flat (non-modal) combat-damage
+        // trigger binds to the damaged player (ControllerRef::TargetPlayer) the
+        // same way destroy/exile/counter already do — not the controller (`You`).
+        let parsed = parse_oracle_text(
+            "Whenever a creature you control deals combat damage to a player, goad target creature that player controls.",
+            "Goad Tester",
+            &[],
+            &[],
+            &[],
+        );
+        let execute = parsed.triggers[0].execute.as_deref().expect("execute body");
+        let Effect::Goad {
+            target: TargetFilter::Typed(typed),
+        } = &*execute.effect
+        else {
+            panic!("expected Goad effect, got {:?}", execute.effect);
+        };
+        assert_eq!(typed.controller, Some(ControllerRef::TargetPlayer));
     }
 
     const FROSTCLIFF_SIEGE_ORACLE: &str = "As this enchantment enters, choose Jeskai or Temur.\n\

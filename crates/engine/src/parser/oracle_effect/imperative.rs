@@ -5990,12 +5990,21 @@ pub(super) fn parse_imperative_family_ast(
                 ))
                 .parse(rest)
                 {
-                    let (target, _) = parse_target(mass_rest);
+                    // CR 109.4: thread the parse context so a "that player
+                    // controls" / "they control" controller suffix binds to the
+                    // trigger's relative-player scope (the damaged player of a
+                    // "deals combat damage to a player" trigger), mirroring the
+                    // destroy/exile/counter paths above.
+                    let (target, _) = parse_target_with_ctx(mass_rest, ctx);
                     return Some(ImperativeFamilyAst::GainKeyword(Effect::GoadAll {
                         target,
                     }));
                 }
-                let (target, _) = parse_target(rest);
+                // CR 109.4 + CR 701.15a: "goad target creature that player
+                // controls" — bind the controller suffix via the live context so
+                // it resolves to the relative-player scope rather than defaulting
+                // to `You` (Grenzo, Havoc Raiser).
+                let (target, _) = parse_target_with_ctx(rest, ctx);
                 Some(ImperativeFamilyAst::GainKeyword(Effect::Goad { target }))
             } else {
                 Some(ImperativeFamilyAst::Goad)
