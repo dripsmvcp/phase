@@ -4184,6 +4184,23 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
         let lower = remaining.to_lowercase();
         let tp = TextPair::new(&remaining, &lower);
 
+        // CR 602.5: Normalize the explicit "Activate this ability only ..."
+        // phrasing to the canonical "Activate only ..." form. Every timing,
+        // limit, and condition arm below is written against "activate only ...",
+        // so this single rewrite unlocks the entire restriction class for cards
+        // that spell out "this ability" (e.g. "Activate this ability only during
+        // your turn") instead of silently dropping the clause. Guarded to the
+        // exact "activate this ability only" phrase so the distinct "any player
+        // may activate this ability [but only ...]" handling below is untouched.
+        if let Some(idx) = tp.rfind("activate this ability only") {
+            remaining = format!(
+                "{}activate only{}",
+                &remaining[..idx],
+                &remaining[idx + "activate this ability only".len()..]
+            );
+            continue;
+        }
+
         // CR 602.5b: A printed "Once each turn" activation restriction stays
         // attached to this activated ability even if the object changes control.
         if let Some(((), rest_original)) = nom_on_lower(&remaining, &lower, |i| {
@@ -8570,6 +8587,69 @@ mod tests {
             )),
             "expected source-on-stack condition, got {:?}",
             restrictions
+        );
+    }
+
+    /// CR 605.1c / CR 602.5: The verbose "Activate this ability only during X"
+    /// phrasing must record the same activation restriction as the canonical
+    /// "Activate only during X" form, instead of dropping the clause (issue
+    /// #2238 — Katara, Water Tribe's Hope; Loch Larent). Tests the whole
+    /// restriction class via one normalization, not a single card.
+    #[test]
+    fn activate_this_ability_only_records_restriction() {
+        let restrictions_for = |text: &str, name: &str| {
+            let parsed = parse(text, name, &[], &["Artifact"], &[]);
+            assert!(
+                parsed.abilities.iter().all(|ability| !matches!(
+                    ability.effect.as_ref(),
+                    Effect::Unimplemented { .. }
+                )),
+                "expected no unimplemented fallback, got {:?}",
+                parsed.abilities
+            );
+            parsed
+                .abilities
+                .into_iter()
+                .find(|ability| !ability.activation_restrictions.is_empty())
+                .expect("expected an activated ability with restrictions")
+                .activation_restrictions
+        };
+
+        // Timing variants — "this ability" phrasing routes through the same
+        // arms as the canonical "Activate only ..." form.
+        for (text, expected) in [
+            (
+                "{T}: Draw a card. Activate this ability only during your turn.",
+                ActivationRestriction::DuringYourTurn,
+            ),
+            (
+                "{T}: Draw a card. Activate this ability only as a sorcery.",
+                ActivationRestriction::AsSorcery,
+            ),
+            (
+                "{T}: Draw a card. Activate this ability only during combat.",
+                ActivationRestriction::DuringCombat,
+            ),
+            (
+                "{T}: Draw a card. Activate this ability only once each turn.",
+                ActivationRestriction::OnlyOnceEachTurn,
+            ),
+        ] {
+            let restrictions = restrictions_for(text, "Test This-Ability Restriction");
+            assert!(
+                restrictions.contains(&expected),
+                "expected {expected:?} for {text:?}, got {restrictions:?}"
+            );
+        }
+
+        // Regression: the canonical phrasing (no "this ability") still parses.
+        let restrictions = restrictions_for(
+            "{T}: Draw a card. Activate only during your turn.",
+            "Test Canonical Restriction",
+        );
+        assert!(
+            restrictions.contains(&ActivationRestriction::DuringYourTurn),
+            "expected DuringYourTurn, got {restrictions:?}"
         );
     }
 
