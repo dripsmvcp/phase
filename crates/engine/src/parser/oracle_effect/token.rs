@@ -303,23 +303,47 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
             value(false, tag(" attacking")),
         ))
         .parse(i)?;
-        let (i, _) = nom::combinator::eof(i)?;
+        // CR 107.3i: The entry clause is terminated either at the end of the
+        // token description or by a trailing ", where X is …" binding clause
+        // (e.g. Anim Pakal's "tokens that are tapped and attacking, where X is
+        // the number of +1/+1 counters on ~"). `peek` leaves that binding tail
+        // in the remainder so the count / P-T `where X is` rebind below still
+        // resolves X — the clause is spliced out, not truncated.
+        let (i, _) = nom::combinator::peek(alt((
+            nom::combinator::eof,
+            nom::combinator::recognize(alt((tag(", where "), tag(" where ")))),
+        )))
+        .parse(i)?;
         Ok((i, tapped))
     };
     // Nom parses forward; scan byte positions (only those starting with the
     // leading space the clause requires) for the first place where the clause
-    // consumes the remainder to EOF. That byte offset is the body length.
+    // matches. The clause spans `[pos, clause_end)`, where `clause_end` excludes
+    // any trailing binding tail left in the peeked remainder.
     let entry_clause = (0..lower_trimmed.len()).find_map(|pos| {
         (lower_trimmed.as_bytes().get(pos) == Some(&b' '))
             .then(|| {
                 attacking_clause(&lower_trimmed[pos..])
                     .ok()
-                    .map(|(_, tapped)| (pos, tapped))
+                    .map(|(rem, tapped)| (pos, lower_trimmed.len() - rem.len(), tapped))
             })
             .flatten()
     });
+    // A trailing ", where X is …" binding (end < text.len()) is spliced out so
+    // the count / P-T `where X is` rebind below still resolves X; a clause that
+    // runs to the end is simply truncated. The owned splice (when needed) is
+    // held here so the rebound `text` can borrow it for the rest of the parse.
+    let spliced_attacking: Option<String> = match entry_clause {
+        Some((start, end, _)) if end < text.len() => {
+            Some(format!("{}{}", &text[..start], &text[end..]))
+        }
+        _ => None,
+    };
     let (text, enters_attacking, enters_tapped_attacking) = match entry_clause {
-        Some((len, tapped)) => (&text[..len], true, tapped),
+        Some((start, _, tapped)) => {
+            let body = spliced_attacking.as_deref().unwrap_or(&text[..start]);
+            (body, true, tapped)
+        }
         None => (text, false, false),
     };
     let (mut count, leading_name, mut rest) =
@@ -1535,6 +1559,42 @@ mod tests {
                     "plural 'that are' clause must set enters_attacking=true"
                 );
                 assert!(matches!(count, QuantityExpr::Fixed { value: 2 }));
+            }
+            other => panic!("Expected Token effect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tapped_and_attacking_with_trailing_where_x_binding_strips_and_binds_count() {
+        // CR 508.4 + CR 107.3i: Anim Pakal, Thousandth Moon — "create X 1/1
+        // colorless Gnome artifact creature tokens that are tapped and
+        // attacking, where X is the number of +1/+1 counters on ~". The trailing
+        // ", where X is …" binding must not block the "tapped and attacking"
+        // strip: the tokens enter tapped and attacking AND the count binds to
+        // the dynamic counter reference (not lost / not Variable("X")).
+        let text = "create X 1/1 colorless Gnome artifact creature tokens that are tapped and attacking, where X is the number of +1/+1 counters on ~";
+        let effect = try_parse_token(&text.to_lowercase(), text, &mut ParseContext::default());
+        match effect {
+            Some(Effect::Token {
+                tapped,
+                enters_attacking,
+                count,
+                ..
+            }) => {
+                assert!(tapped, "trailing where-X must not block tapped=true");
+                assert!(
+                    enters_attacking,
+                    "trailing where-X must not block enters_attacking=true"
+                );
+                assert!(
+                    matches!(
+                        count,
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::CountersOn { .. }
+                        }
+                    ),
+                    "count must bind to the dynamic +1/+1 counter reference, got {count:?}"
+                );
             }
             other => panic!("Expected Token effect, got {:?}", other),
         }
