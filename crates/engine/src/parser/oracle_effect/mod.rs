@@ -165,6 +165,10 @@ pub(crate) fn resolve_it_pronoun(ctx: &mut ParseContext) -> TargetFilter {
         Some(subject) if !matches!(subject, TargetFilter::SelfRef | TargetFilter::Any) => {
             TargetFilter::TriggeringSource
         }
+        // CR 608.2k: After a token-creating effect earlier in the chain, a bare
+        // "it" refers to the just-created token (God-Pharaoh's Gift's "It gains
+        // haste", copy-token cards) rather than the ability's source object.
+        _ if ctx.token_created => TargetFilter::LastCreated,
         _ => TargetFilter::SelfRef,
     }
 }
@@ -15827,6 +15831,12 @@ pub(crate) fn parse_effect_chain_ir(
             parent_target_available,
             effect_chain_full_lower: ctx.effect_chain_full_lower.clone(),
             parent_target_is_chosen,
+            // CR 608.2k: a bare "it"/"they" pronoun in this chunk binds to the
+            // just-created token when a token-creating clause precedes it in the
+            // same chain (God-Pharaoh's Gift's trailing "It gains haste").
+            token_created: clauses
+                .iter()
+                .any(|clause| lower::is_token_creating_effect(&clause.parsed.effect)),
             ..Default::default()
         };
         let ctx = &mut chunk_ctx;

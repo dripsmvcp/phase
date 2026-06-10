@@ -1464,6 +1464,10 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
         Some(subject) if !matches!(subject, TargetFilter::SelfRef | TargetFilter::Any) => {
             TargetFilter::TriggeringSource
         }
+        // CR 608.2k: After a token-creating effect earlier in the chain, a bare
+        // "they" refers to the just-created tokens ("create N tokens. They gain
+        // haste") rather than an earlier anaphoric target.
+        _ if ctx.token_created => TargetFilter::LastCreated,
         // No trigger context — anaphoric reference to previously mentioned objects
         _ => TargetFilter::ParentTarget,
     }

@@ -15,6 +15,15 @@ use crate::types::zones::Zone;
 pub(crate) struct ParseContext {
     /// The current subject (resolved target — "it", "that creature").
     pub subject: Option<TargetFilter>,
+    /// CR 608.2k: True once a token-creating effect (`Token` / `CopyTokenOf` /
+    /// `Populate`) has been parsed earlier in the current effect chain. A bare
+    /// pronoun "it"/"they" parsed afterward refers to the just-created token
+    /// (God-Pharaoh's Gift's "It gains haste"), so `resolve_it_pronoun` /
+    /// `resolve_they_pronoun` bind it to `TargetFilter::LastCreated` instead of
+    /// the ability's source. Set per-clause by the `parse_effect_chain_ir`
+    /// chunk loop; only the literal pronoun resolvers consult it, so a `~`
+    /// self-reference (which never flows through them) is unaffected.
+    pub token_created: bool,
     /// Card name for self-reference (~) normalization.
     pub card_name: Option<String>,
     /// CR 707.9a + CR 603.1: Index of the printed trigger whose body is being
