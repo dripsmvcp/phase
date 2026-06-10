@@ -6,9 +6,9 @@ use nom::sequence::{delimited, preceded, terminated};
 use nom::Parser;
 
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, AdditionalCostPaymentSource, ChoiceType, Effect, ModalChoice,
-    ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter, ReplacementDefinition,
-    StaticCondition, TargetFilter, TriggerCondition,
+    AbilityDefinition, AbilityKind, AdditionalCostPaymentSource, ChoiceType, ControllerRef, Effect,
+    ModalChoice, ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter,
+    ReplacementDefinition, StaticCondition, TargetFilter, TriggerCondition,
 };
 use crate::types::replacements::ReplacementEvent;
 
@@ -621,12 +621,18 @@ pub(crate) fn lower_oracle_block(
             // `GenericEffect` with no target, so without this threading the
             // "Pick a Perk" mode emits an unresolvable `ParentTarget`.
             let modal_subject = derive_modal_subject(&triggers);
+            // CR 109.4 + CR 506.2 + CR 120.3: Derive the event-bound player
+            // scope from the trigger condition so each mode body resolves "that
+            // player" against the same player a non-modal trigger body would.
+            let relative_player_scope =
+                super::oracle_trigger::derive_relative_player_scope(&trigger_line.to_lowercase());
             let modal_execute = Box::new(build_modal_ability_with_subject(
                 AbilityKind::Spell,
                 &header,
                 &modes,
                 modal_subject,
                 host_self_reference,
+                relative_player_scope,
             ));
             for trigger in &mut triggers {
                 trigger.execute = Some(modal_execute.clone());
@@ -831,10 +837,17 @@ fn build_modal_ability_with_subject(
     modes: &[ModeAst],
     subject: Option<TargetFilter>,
     host_self_reference: Option<TargetFilter>,
+    relative_player_scope: Option<ControllerRef>,
 ) -> AbilityDefinition {
     AbilityDefinition::new(kind, modal_marker_effect(header)).with_modal(
         build_modal_choice(header, modes),
-        lower_mode_abilities_with_subject(modes, kind, subject, host_self_reference),
+        lower_mode_abilities_with_subject(
+            modes,
+            kind,
+            subject,
+            host_self_reference,
+            relative_player_scope,
+        ),
     )
 }
 
@@ -933,7 +946,7 @@ fn lower_mode_abilities(
     kind: AbilityKind,
     host_self_reference: Option<TargetFilter>,
 ) -> Vec<AbilityDefinition> {
-    lower_mode_abilities_with_subject(modes, kind, None, host_self_reference)
+    lower_mode_abilities_with_subject(modes, kind, None, host_self_reference, None)
 }
 
 /// Variant of `lower_mode_abilities` that threads a trigger subject through
@@ -950,17 +963,42 @@ fn lower_mode_abilities_with_subject(
     kind: AbilityKind,
     subject: Option<TargetFilter>,
     host_self_reference: Option<TargetFilter>,
+    relative_player_scope: Option<ControllerRef>,
 ) -> Vec<AbilityDefinition> {
     let mut ctx = ParseContext {
         subject,
         host_self_reference,
+        // CR 109.4 + CR 506.2 + CR 120.3: A modal trigger that introduces an
+        // event-bound player ("deals combat damage to a player, choose one —")
+        // must resolve "that player" / target-possessive references inside each
+        // mode body against that player, exactly as a non-modal trigger body
+        // does. Without this the mode bodies default to `ControllerRef::You`
+        // (Grenzo, Havoc Raiser goaded the controller's own creatures).
+        relative_player_scope: relative_player_scope.clone(),
         ..Default::default()
     };
     modes
         .iter()
         .map(|mode| {
             let parsed = parse_effect_chain_with_context(&mode.body, kind, &mut ctx);
-            guard_unsupported_mode_qualifiers(&mode.body, parsed, kind)
+            let mut parsed = guard_unsupported_mode_qualifiers(&mode.body, parsed, kind);
+            // CR 603.7c + CR 120.3 + CR 506.2: Mirror the non-modal trigger
+            // lowering — rebind event-player possessive quantities so they
+            // resolve against the damaged/chosen player, not an absent target.
+            match relative_player_scope {
+                Some(ControllerRef::TargetPlayer) => {
+                    crate::parser::oracle_effect::rewrite_event_player_quantity_refs_to_scoped(
+                        &mut parsed,
+                    );
+                }
+                Some(ControllerRef::SourceChosenPlayer) => {
+                    crate::parser::oracle_effect::rewrite_player_quantity_refs_to_source_chosen(
+                        &mut parsed,
+                    );
+                }
+                _ => {}
+            }
+            parsed
         })
         .collect()
 }
@@ -1424,6 +1462,43 @@ mod tests {
         assert_eq!(modal.max_choices, 1);
         assert_eq!(modal.mode_count, 2);
         assert_eq!(execute.mode_abilities.len(), 2);
+    }
+
+    const GRENZO_ORACLE: &str = "Whenever a creature you control deals combat damage to a player, choose one —\n\
+• Goad target creature that player controls.\n\
+• Exile the top card of that player's library. Until end of turn, you may cast that card and you may spend mana as though it were mana of any color to cast that spell.";
+
+    #[test]
+    fn grenzo_modal_damage_trigger_binds_that_player_to_damaged_player() {
+        // CR 109.4 + CR 120.3 + CR 506.2: A modal trigger that introduces an
+        // event-bound player ("deals combat damage to a player, choose one —")
+        // must resolve "that player" inside each mode body against the damaged
+        // player, not the controller. Regression for #2346 — Grenzo's Goad mode
+        // must goad a creature the DAMAGED player controls (TargetPlayer), not
+        // the controller's own creatures (You).
+        use crate::types::ability::ControllerRef;
+        let parsed = parse_oracle_text(GRENZO_ORACLE, "Grenzo, Havoc Raiser", &[], &[], &[]);
+        let trigger = parsed
+            .triggers
+            .iter()
+            .find(|t| t.mode == TriggerMode::DamageDone)
+            .expect("expected a damage-to-player trigger");
+        let execute = trigger
+            .execute
+            .as_deref()
+            .expect("trigger should have a modal execute body");
+        assert_eq!(execute.mode_abilities.len(), 2, "two modes expected");
+        match execute.mode_abilities[0].effect.as_ref() {
+            Effect::Goad {
+                target: TargetFilter::Typed(t),
+                ..
+            } => assert_eq!(
+                t.controller,
+                Some(ControllerRef::TargetPlayer),
+                "Goad mode must target a creature the damaged player controls",
+            ),
+            other => panic!("expected Goad with a typed target, got {other:?}"),
+        }
     }
 
     #[test]
