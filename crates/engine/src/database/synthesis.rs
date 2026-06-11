@@ -12097,6 +12097,150 @@ mod undying_persist_runtime_tests {
         (state, obj_id)
     }
 
+    /// Stand up a vanilla creature (no intrinsic `granted` keyword) on the
+    /// battlefield alongside a second permanent whose continuous static grants
+    /// `granted` to it — the Mikaeus, the Unhallowed shape ("other non-Human
+    /// creatures you control … have undying"). Layers are evaluated so the
+    /// granted keyword and its companion dies-trigger are live before the kill.
+    /// Returns the state and the recipient's object id.
+    ///
+    /// Regression coverage for issue #2944: a layer-granted keyword's companion
+    /// trigger lives only on the recipient's live `trigger_definitions`, which
+    /// `revert_layered_characteristics_to_base` discards on battlefield exit, so
+    /// the dies trigger must be re-derived from the LKI keyword snapshot
+    /// (CR 603.10a + CR 604.1).
+    fn setup_with_granted_keyword(granted: Keyword) -> (GameState, ObjectId) {
+        use crate::game::layers::evaluate_layers;
+        use crate::types::ability::{ContinuousModification, StaticDefinition, TargetFilter};
+
+        let mut victim_face = CardFace {
+            name: "Grant Recipient".to_string(),
+            power: Some(PtValue::Fixed(2)),
+            toughness: Some(PtValue::Fixed(2)),
+            ..CardFace::default()
+        };
+        victim_face.card_type.core_types.push(CoreType::Creature);
+        synthesize_all(&mut victim_face);
+        let (mut state, victim) = setup_with_creature(&victim_face, PlayerId(0));
+
+        let mut source_face = CardFace {
+            name: "Keyword Granter".to_string(),
+            power: Some(PtValue::Fixed(5)),
+            toughness: Some(PtValue::Fixed(5)),
+            ..CardFace::default()
+        };
+        source_face.card_type.core_types.push(CoreType::Creature);
+        let source = create_face_object(&mut state, &source_face, PlayerId(0), Zone::Battlefield);
+        let def = StaticDefinition::continuous()
+            .affected(TargetFilter::SpecificObject { id: victim })
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: granted,
+            }]);
+        {
+            // Static-ability continuous effects are ordered by the source's
+            // timestamp, and the gather reads `base_static_definitions`.
+            let ts = state.next_timestamp();
+            let src = state.objects.get_mut(&source).unwrap();
+            src.timestamp = ts;
+            std::sync::Arc::make_mut(&mut src.base_static_definitions).push(def);
+        }
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+        (state, victim)
+    }
+
+    /// CR 702.93a + CR 604.1 (issue #2944): a creature granted undying by a
+    /// static (Mikaeus, the Unhallowed) that dies with zero +1/+1 counters
+    /// returns to the battlefield with one +1/+1 counter — exactly as intrinsic
+    /// undying does — even though the granted trigger is discarded from the
+    /// recipient's live `trigger_definitions` on battlefield exit.
+    #[test]
+    fn granted_undying_returns_creature_on_death() {
+        let (mut state, victim) = setup_with_granted_keyword(Keyword::Undying);
+        assert!(
+            state
+                .objects
+                .get(&victim)
+                .unwrap()
+                .keywords
+                .contains(&Keyword::Undying),
+            "granted undying keyword is live before death"
+        );
+
+        let _ = kill_and_resolve(&mut state, victim);
+
+        let obj = state.objects.get(&victim).unwrap();
+        assert_eq!(
+            obj.zone,
+            Zone::Battlefield,
+            "granted undying must return the creature to the battlefield"
+        );
+        // CR 702.93a: "under its owner's control"
+        assert_eq!(obj.controller, PlayerId(0));
+        let p1p1: u32 = obj
+            .counters
+            .iter()
+            .filter(|(ct, _)| **ct == CounterType::Plus1Plus1)
+            .map(|(_, n)| *n)
+            .sum();
+        assert_eq!(p1p1, 1, "granted undying returns with one +1/+1 counter");
+    }
+
+    /// CR 702.93a intervening-if for the granted path: a creature granted
+    /// undying that dies WITH a +1/+1 counter must NOT return. The
+    /// `Not(HadCounters)` condition reads the LKI snapshot, so the re-derived
+    /// granted trigger is gated out identically to the intrinsic path.
+    #[test]
+    fn granted_undying_does_not_return_when_died_with_p1p1_counter() {
+        let (mut state, victim) = setup_with_granted_keyword(Keyword::Undying);
+        state
+            .objects
+            .get_mut(&victim)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, 1);
+
+        let _ = kill_and_resolve(&mut state, victim);
+
+        let obj = state.objects.get(&victim).unwrap();
+        assert_eq!(
+            obj.zone,
+            Zone::Graveyard,
+            "granted undying must not return a creature that died with a +1/+1 counter"
+        );
+        assert!(
+            !state
+                .stack
+                .iter()
+                .any(|e| matches!(e.kind, StackEntryKind::TriggeredAbility { .. })),
+            "the intervening-if filtered the re-derived granted trigger"
+        );
+    }
+
+    /// CR 702.79a + CR 604.1: build-for-the-class sibling — granted persist
+    /// (the -1/-1 counter polarity) returns the creature through the same
+    /// LKI look-back path, confirming the fix is keyword-general, not undying-only.
+    #[test]
+    fn granted_persist_returns_creature_on_death() {
+        let (mut state, victim) = setup_with_granted_keyword(Keyword::Persist);
+
+        let _ = kill_and_resolve(&mut state, victim);
+
+        let obj = state.objects.get(&victim).unwrap();
+        assert_eq!(
+            obj.zone,
+            Zone::Battlefield,
+            "granted persist must return the creature to the battlefield"
+        );
+        let m1m1: u32 = obj
+            .counters
+            .iter()
+            .filter(|(ct, _)| **ct == CounterType::Minus1Minus1)
+            .map(|(_, n)| *n)
+            .sum();
+        assert_eq!(m1m1, 1, "granted persist returns with one -1/-1 counter");
+    }
+
     /// Kill the permanent (battlefield → graveyard), fire its dies-trigger,
     /// then resolve the top of the stack. Returns the events the chain
     /// produced so callers can inspect the return-to-battlefield event.

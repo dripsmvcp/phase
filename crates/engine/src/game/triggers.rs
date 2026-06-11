@@ -313,26 +313,62 @@ fn collect_matching_triggers(
     // the off-zone trigger scan sees them, mirroring how `off_zone_characteristics`
     // synthesizes the keyword itself. The printed-keyword path is unaffected:
     // printed Suspend already carries these triggers in `base_trigger_definitions`.
-    let granted_off_zone_triggers: Vec<(crate::types::keywords::KeywordKind, TriggerDefinition)> =
-        if zone_filter.is_some_and(|z| z != Zone::Battlefield) {
+    let mut synthesized_granted_triggers: Vec<(
+        crate::types::keywords::KeywordKind,
+        TriggerDefinition,
+    )> = if zone_filter.is_some_and(|z| z != Zone::Battlefield) {
+        let base_keyword_kinds: Vec<_> =
+            source_obj.base_keywords.iter().map(|k| k.kind()).collect();
+        crate::game::off_zone_characteristics::effective_off_zone_keywords(state, obj_id)
+            .iter()
+            // Only synthesize for keywords that were *granted* (absent from
+            // the printed/base set) — printed keywords already carry their
+            // companion triggers via synthesis at database-build time.
+            .filter(|kw| !base_keyword_kinds.contains(&kw.kind()))
+            .flat_map(|kw| {
+                let kind = kw.kind();
+                crate::database::synthesis::KeywordTriggerInstaller::triggers_for(kw)
+                    .into_iter()
+                    .map(move |trig| (kind, trig))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // CR 603.10a + CR 604.1: Leaves-the-battlefield look-back for runtime-granted
+    // keyword-triggered abilities (granted undying / persist / afterlife / …).
+    // When an object has just left the battlefield, `apply_zone_exit_cleanup` →
+    // `revert_layered_characteristics_to_base` has already reset its live
+    // `trigger_definitions` to the printed base, dropping any keyword trigger that
+    // a static had granted it (e.g. Mikaeus, the Unhallowed's "other non-Human
+    // creatures you control have undying"). Unlike a *printed* keyword — whose
+    // companion trigger lives in `base_trigger_definitions` and survives the
+    // revert — a layer-granted keyword's trigger lives only in the now-discarded
+    // live set, so the dies/leaves trigger would never fire. The granted keywords
+    // do survive in the LKI snapshot captured (before the revert) by
+    // `apply_zone_exit_cleanup`, so re-synthesize their companion triggers from
+    // that snapshot, mirroring the off-zone grant path above. Gated to the
+    // last-known-information look-back scan (the object is already off the
+    // battlefield) so a *living* battlefield object — whose live
+    // `trigger_definitions` still carry the granted trigger — is never
+    // double-counted. Triggers whose event doesn't match this departure (a
+    // granted attack keyword, say) are filtered out downstream by event matching.
+    if zone_filter == Some(Zone::Battlefield) && source_obj.zone != Zone::Battlefield {
+        if let Some(lki) = state.lki_cache.get(&obj_id) {
             let base_keyword_kinds: Vec<_> =
                 source_obj.base_keywords.iter().map(|k| k.kind()).collect();
-            crate::game::off_zone_characteristics::effective_off_zone_keywords(state, obj_id)
-                .iter()
-                // Only synthesize for keywords that were *granted* (absent from
-                // the printed/base set) — printed keywords already carry their
-                // companion triggers via synthesis at database-build time.
-                .filter(|kw| !base_keyword_kinds.contains(&kw.kind()))
-                .flat_map(|kw| {
-                    let kind = kw.kind();
-                    crate::database::synthesis::KeywordTriggerInstaller::triggers_for(kw)
-                        .into_iter()
-                        .map(move |trig| (kind, trig))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+            for kw in &lki.keywords {
+                if base_keyword_kinds.contains(&kw.kind()) {
+                    continue;
+                }
+                let kind = kw.kind();
+                for trig in crate::database::synthesis::KeywordTriggerInstaller::triggers_for(kw) {
+                    synthesized_granted_triggers.push((kind, trig));
+                }
+            }
+        }
+    }
 
     let source_phase_out_event = matches!(
         event,
@@ -348,9 +384,10 @@ fn collect_matching_triggers(
     // after the status flip, so this one event must read only PhaseOut definitions
     // directly from the source while leaving all other phased-out abilities inert.
     //
-    // Synthesized off-zone granted-keyword triggers are appended after the
-    // printed set with indices offset past `obj.trigger_definitions.len()` so
-    // the `(obj_id, trig_idx)` dedup keys never collide with printed triggers.
+    // Synthesized granted-keyword triggers (off-zone grants and the
+    // leaves-the-battlefield LKI look-back) are appended after the printed set
+    // with indices offset past `obj.trigger_definitions.len()` so the
+    // `(obj_id, trig_idx)` dedup keys never collide with printed triggers.
     let printed_trigger_count = source_obj.trigger_definitions.len();
     let printed_triggers: Vec<(
         usize,
@@ -372,16 +409,17 @@ fn collect_matching_triggers(
             .collect()
     };
     let all_triggers = printed_triggers.into_iter().chain(
-        granted_off_zone_triggers
+        synthesized_granted_triggers
             .iter()
             .enumerate()
             .map(|(i, (kind, def))| (printed_trigger_count + i, def, Some(*kind))),
     );
     for (trig_idx, trig_def, granted_keyword_kind) in all_triggers {
         // Synthesized granted-keyword companion triggers (off-zone Suspend
-        // grant) carry a keyword-keyed `MayTriggerOrigin` — the synthetic
-        // `trig_idx` points past `trigger_definitions` and must not be used as
-        // a `Printed` index. Printed triggers keep their stable index.
+        // grant, or the leaves-the-battlefield LKI look-back) carry a
+        // keyword-keyed `MayTriggerOrigin` — the synthetic `trig_idx` points
+        // past `trigger_definitions` and must not be used as a `Printed` index.
+        // Printed triggers keep their stable index.
         // Zone guard: only fire a trigger if its declared zones include the zone being scanned.
         // Empty trigger_zones defaults to battlefield-only (engine-internal triggers like
         // prowess/ward). Parser-created non-battlefield triggers set trigger_zones explicitly.
