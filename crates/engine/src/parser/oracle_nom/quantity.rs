@@ -400,18 +400,39 @@ fn parse_pre_controller_chosen_filter_suffix(input: &str) -> OracleResult<'_, Fi
     .parse(input)
 }
 
-/// CR 121.1 + CR 604.3: "cards you've drawn this turn" after "the number of".
-/// Reuses the runtime `CardsDrawnThisTurn` quantity ref already wired for
-/// condition checks (Duelist of the Mind CDA).
-fn parse_number_of_cards_drawn_this_turn(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (rest, player) = alt((
-        value(PlayerScope::Controller, tag("cards you've drawn this turn")),
+/// CR 121.1: Parse the player-scoped "drawn this turn" tail shared by the
+/// "the number of <noun> …" and "for each <noun> …" frames. Maps the subject
+/// phrase to a `PlayerScope`: "you've / you have" → `Controller`; "your
+/// opponents have" → `Opponent { aggregate: Sum }` (the total cards drawn
+/// across every opponent — `resolve_per_player_scalar` sums the per-player
+/// `cards_drawn_this_turn`). The leading space belongs to the tail so callers
+/// match the bare noun ("card" / "cards") first.
+fn parse_cards_drawn_this_turn_tail(input: &str) -> OracleResult<'_, PlayerScope> {
+    alt((
         value(
-            PlayerScope::Controller,
-            tag("cards you have drawn this turn"),
+            PlayerScope::Opponent {
+                aggregate: AggregateFunction::Sum,
+            },
+            tag(" your opponents have drawn this turn"),
         ),
+        value(PlayerScope::Controller, tag(" you've drawn this turn")),
+        value(PlayerScope::Controller, tag(" you have drawn this turn")),
     ))
-    .parse(input)?;
+    .parse(input)
+}
+
+/// CR 121.1 + CR 604.3: "card(s) [you've / your opponents have] drawn this
+/// turn" — the per-player cards-drawn aggregate. Frame-neutral: registered in
+/// both the "the number of …" path (Duelist of the Mind CDA, controller form)
+/// and the "for each …" path (Heliod, the Warped Eclipse's cost reduction
+/// "for each card your opponents have drawn this turn", opponent-summed form).
+/// Reuses the runtime `CardsDrawnThisTurn` quantity ref already wired for
+/// condition checks. Singular "card" and plural "cards" both match so the
+/// noun agrees with either the "the number of cards …" or the "for each card …"
+/// surface grammar.
+fn parse_cards_drawn_this_turn_quantity(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, _) = alt((tag("cards"), tag("card"))).parse(input)?;
+    let (rest, player) = parse_cards_drawn_this_turn_tail(rest)?;
     Ok((rest, QuantityRef::CardsDrawnThisTurn { player }))
 }
 
@@ -729,9 +750,10 @@ fn parse_number_of_inner(input: &str) -> OracleResult<'_, QuantityRef> {
         // `parse_number_of_controlled_type`, whose " you control" suffix does
         // not match the battlefield-wide form.
         parse_number_of_type_on_battlefield_with_keyword,
-        // CR 121.1: "cards you've drawn this turn" — must precede generic
-        // controlled-type arms whose type words could overlap.
-        parse_number_of_cards_drawn_this_turn,
+        // CR 121.1: "cards [you've / your opponents have] drawn this turn" —
+        // must precede generic controlled-type arms whose type words could
+        // overlap.
+        parse_cards_drawn_this_turn_quantity,
         parse_number_of_controlled_type,
         parse_cards_exiled_with_source,
         // CR 109.4 + CR 115.7: "cards in their <zone>" / "cards in that player's <zone>"
@@ -2107,6 +2129,11 @@ fn parse_for_each_clause_ref_with_they_controller(
 ) -> OracleResult<'_, QuantityRef> {
     alt((
         parse_for_each_opponents_life_change,
+        // CR 121.1: "card your opponents have drawn this turn" (Heliod, the
+        // Warped Eclipse) / "card you've drawn this turn". Anchored by the
+        // "drawn this turn" tail, so non-draw "card …" phrases backtrack to
+        // the generic type arms below.
+        parse_cards_drawn_this_turn_quantity,
         parse_counter_added_this_turn_for_each,
         parse_object_colors_for_each,
         parse_object_name_word_count_for_each,
@@ -3264,6 +3291,57 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    /// CR 121.1: the opponent-summed cards-drawn form parses in both the
+    /// "the number of …" frame and the "for each …" frame (Heliod, the Warped
+    /// Eclipse). Singular "card" and plural "cards" both bind; the controller
+    /// form stays `Controller` and the opponents form aggregates by `Sum`.
+    #[test]
+    fn parse_cards_drawn_this_turn_player_scopes() {
+        let opponents = QuantityRef::CardsDrawnThisTurn {
+            player: PlayerScope::Opponent {
+                aggregate: AggregateFunction::Sum,
+            },
+        };
+        let controller = QuantityRef::CardsDrawnThisTurn {
+            player: PlayerScope::Controller,
+        };
+
+        // "the number of …" frame.
+        for (text, expected) in [
+            (
+                "the number of cards your opponents have drawn this turn",
+                &opponents,
+            ),
+            ("the number of cards you've drawn this turn", &controller),
+        ] {
+            let (rest, q) = parse_quantity_ref(text).unwrap();
+            assert_eq!(rest, "", "{text:?} should fully consume");
+            assert_eq!(&q, expected, "{text:?}");
+        }
+
+        // "for each …" frame (cost-reduction / pump clause).
+        for (clause, expected) in [
+            ("card your opponents have drawn this turn", &opponents),
+            ("cards you've drawn this turn", &controller),
+        ] {
+            let (rest, q) = parse_for_each_clause_ref(clause).expect(clause);
+            assert_eq!(rest, "", "{clause:?} should fully consume");
+            assert_eq!(&q, expected, "{clause:?}");
+        }
+    }
+
+    /// Regression: a non-draw "card …" for-each clause must NOT be swallowed by
+    /// the cards-drawn arm — it backtracks to the generic type arms.
+    #[test]
+    fn cards_drawn_arm_backtracks_for_non_draw_card_clauses() {
+        let (rest, q) = parse_for_each_clause_ref("card in your graveyard").expect("card clause");
+        assert_eq!(rest, "");
+        assert!(
+            !matches!(q, QuantityRef::CardsDrawnThisTurn { .. }),
+            "non-draw card clause must not map to CardsDrawnThisTurn, got {q:?}"
+        );
     }
 
     /// End-to-end: CDA static lines must lower once the quantity arms parse.

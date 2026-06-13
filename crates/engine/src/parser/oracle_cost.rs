@@ -1276,7 +1276,7 @@ fn parse_mana_cost_nom(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::{ControllerRef, TypeFilter, TypedFilter};
+    use crate::types::ability::{AggregateFunction, ControllerRef, TypeFilter, TypedFilter};
     use crate::types::counter::CounterMatch;
     use crate::types::mana::{ManaCost, ManaCostShard};
 
@@ -1907,6 +1907,32 @@ mod tests {
     #[test]
     fn cost_reduction_unrecognized_returns_none() {
         assert!(try_parse_cost_reduction("something else entirely").is_none());
+    }
+
+    /// CR 601.2f + CR 121.1: the per-each "for each card your opponents have
+    /// drawn this turn" count must bind to the opponent-summed cards-drawn
+    /// aggregate, not a generic `ObjectCount` over a `Card` filter (which
+    /// over-reduces). Mirrors Heliod, the Warped Eclipse's static `ModifyCost`,
+    /// which shares this `parse_for_each_clause` seam.
+    #[test]
+    fn cost_reduction_for_each_card_opponents_drew() {
+        let reduction = try_parse_cost_reduction(
+            "this spell costs {1} less to cast for each card your opponents have drawn this turn",
+        )
+        .expect("should parse the opponents-drew cost reduction");
+        assert_eq!(reduction.amount_per, 1);
+        assert_eq!(
+            reduction.count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::CardsDrawnThisTurn {
+                    player: PlayerScope::Opponent {
+                        aggregate: AggregateFunction::Sum,
+                    },
+                },
+            },
+            "per-each count should be opponent-summed CardsDrawnThisTurn, got {:?}",
+            reduction.count
+        );
     }
 
     #[test]

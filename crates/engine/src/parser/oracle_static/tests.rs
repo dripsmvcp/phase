@@ -1935,6 +1935,39 @@ fn static_this_spell_cost_less_self_scoped_in_castable_zones() {
     );
 }
 
+/// Issue #2849 (CR 601.2f + CR 121.1): Heliod, the Warped Eclipse — "Spells you
+/// cast cost {1} less to cast for each card your opponents have drawn this turn."
+/// The per-each `dynamic_count` must bind to the opponent-summed
+/// `CardsDrawnThisTurn` aggregate, not a generic `ObjectCount` over a `Card`
+/// filter (which dropped the "opponents have drawn this turn" scoping and
+/// over-reduced the whole generic cost).
+#[test]
+fn heliod_spells_cost_less_per_opponent_card_drawn() {
+    let def = parse_static_line(
+        "Spells you cast cost {1} less to cast for each card your opponents have drawn this turn.",
+    )
+    .unwrap();
+
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        amount: ManaCost::Cost { generic: 1, .. },
+        dynamic_count: Some(dynamic_count),
+        ..
+    } = def.mode
+    else {
+        panic!("expected dynamic ReduceCost static, got {:?}", def.mode);
+    };
+    assert_eq!(
+        dynamic_count,
+        QuantityRef::CardsDrawnThisTurn {
+            player: PlayerScope::Opponent {
+                aggregate: AggregateFunction::Sum,
+            },
+        },
+        "dynamic_count should be opponent-summed CardsDrawnThisTurn"
+    );
+}
+
 /// Issue #1372: Demilich's self-spell reduction must function from the graveyard
 /// during cast-time cost determination.
 #[test]
