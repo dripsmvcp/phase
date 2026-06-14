@@ -1057,7 +1057,13 @@ fn lower_mode_abilities_with_subject(
     host_self_reference: Option<TargetFilter>,
     relative_player_scope: Option<ControllerRef>,
 ) -> Vec<AbilityDefinition> {
-    lower_mode_abilities_with_scope(modes, kind, subject, relative_player_scope, host_self_reference)
+    lower_mode_abilities_with_scope(
+        modes,
+        kind,
+        subject,
+        relative_player_scope,
+        host_self_reference,
+    )
 }
 
 /// Variant of `lower_mode_abilities_with_subject` that additionally seeds

@@ -19,11 +19,11 @@
 //!      context-free `parse_target`, so "that player controls" resolved to
 //!      `ControllerRef::You` even when the surrounding scope was set.
 //!
-//! CR 120.3 + CR 608.2i: "deals combat damage to a player" introduces the
-//! damaged player as the "that player" referent. The fix threads the trigger's
-//! relative-player scope (`relative_player_scope_for_condition`) into modal mode
-//! bodies and routes Goad through the context-aware target parser, so the modal
-//! now matches the established non-modal / Dokuchi Silencer parse.
+//! CR 603.7c + CR 120.3: "deals combat damage to a player" is a DamageDone
+//! trigger whose damaged player is bound as `TriggeringPlayer` in the event
+//! context. The fix threads the trigger's relative-player scope into modal mode
+//! bodies and routes Goad through the context-aware target parser, so both modal
+//! and non-modal Goad correctly bind "that player controls" to TriggeringPlayer.
 
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{ControllerRef, Effect, TargetFilter};
@@ -63,13 +63,14 @@ fn grenzo_modal_binds_that_player_to_the_damaged_player() {
     assert_eq!(modes.len(), 2, "Grenzo is a two-mode `choose one —`");
 
     // Mode 0: "Goad target creature that player controls." The creature filter's
-    // controller must be the damaged player (TargetPlayer), not the controller.
+    // controller must be the damaged player (TriggeringPlayer per CR 603.7c —
+    // DamageDone triggers bind the damaged player as TriggeringPlayer), not You.
     match modes[0].effect.as_ref() {
         Effect::Goad { target } => assert_eq!(
             typed_controller(target),
-            Some(&ControllerRef::TargetPlayer),
-            "CR 109.4: Goad must target a creature the damaged player controls \
-             (TargetPlayer), not the ability's controller. got: {target:?}"
+            Some(&ControllerRef::TriggeringPlayer),
+            "CR 109.4 + CR 603.7c: Goad must target a creature the damaged player controls \
+             (TriggeringPlayer), not the ability's controller. got: {target:?}"
         ),
         other => panic!("mode 0 must be Goad, got {other:?}"),
     }
@@ -107,8 +108,8 @@ fn non_modal_goad_honors_relative_player_scope() {
     match trigger.effect.as_ref() {
         Effect::Goad { target } => assert_eq!(
             typed_controller(target),
-            Some(&ControllerRef::TargetPlayer),
-            "non-modal Goad must also bind to the damaged player, got: {target:?}"
+            Some(&ControllerRef::TriggeringPlayer),
+            "CR 603.7c: non-modal Goad must bind to the damaged player (TriggeringPlayer), got: {target:?}"
         ),
         other => panic!("expected Goad, got {other:?}"),
     }
