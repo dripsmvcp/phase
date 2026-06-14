@@ -32,8 +32,33 @@ pub fn resolve(
         state,
         &choice_type,
         ability.controller,
+        ability.source_id,
         &ability.chosen_players,
     );
+
+    // CR 609.3: If an effect attempts to do something impossible, it does only
+    // as much as possible. When the engine enumerates the legal options for a
+    // choice and the list is empty (e.g. "choose a player" once every eligible
+    // player has already been chosen earlier in this resolution, or a "choose
+    // an ability the target has" with no abilities to remove), there is nothing
+    // to choose. The choice does nothing; the chain driver then skips any
+    // continuation that depends on the missing chosen value while allowing
+    // independent siblings to proceed. Emitting a `WaitingFor::NamedChoice`
+    // with no options would wedge the game (issue #3040): the legal-action
+    // enumerator yields no `ChooseOption`, so no player can advance the
+    // decision. `CardName` / `Word` / `Artist` are excluded because their value
+    // is player-supplied, so an empty engine list there is expected, not
+    // impossible (only `CardName` has a wired free-text supply path today;
+    // `Word` / `Artist` are a separate known frontend gap — see
+    // `options_supplied_by_player`).
+    if options.is_empty() && !choice_type.options_supplied_by_player() {
+        state.cost_payment_failed_flag = true;
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+        });
+        return Ok(());
+    }
 
     state.waiting_for = WaitingFor::NamedChoice {
         player: ability.controller,
@@ -128,6 +153,7 @@ fn compute_options(
     state: &GameState,
     choice_type: &ChoiceType,
     controller: PlayerId,
+    source_id: crate::types::identifiers::ObjectId,
     already_chosen: &[PlayerId],
 ) -> Vec<String> {
     match choice_type {
@@ -162,11 +188,24 @@ fn compute_options(
         ChoiceType::Labeled { options } => options.clone(),
         // CR 205.3i: Land types include the basic land types plus Cave, Desert, Gate, etc.
         ChoiceType::LandType => to_strings(LAND_TYPES),
-        // CR 800.4a: An opponent is any other player in the game.
+        // CR 102.3: An opponent is any player not on the choosing player's team
+        // (in a free-for-all game, every other player). `players::opponents`
+        // already drops eliminated players (CR 104.3a — a player who loses
+        // leaves the game and is no longer an opponent).
         // CR 608.2c: Exclude players already chosen earlier in this resolution.
-        ChoiceType::Opponent => players::opponents(state, controller)
+        // CR 102.3 + CR 608.2d: When a `restriction` is present ("with the most
+        // life among your opponents"), narrow the eligible set to opponents
+        // satisfying that `PlayerFilter` — the controller then picks ONE of the
+        // qualifying opponents (CR 608.2d handles ties), keeping it a single
+        // pick rather than fanning the effect out to every tied opponent.
+        ChoiceType::Opponent { restriction } => players::opponents(state, controller)
             .iter()
             .filter(|id| !already_chosen.contains(id))
+            .filter(|id| {
+                restriction.as_ref().is_none_or(|filter| {
+                    super::matches_player_scope(state, **id, filter, controller, source_id)
+                })
+            })
             .map(|id| id.0.to_string())
             .collect(),
         // CR 102.1: A player is one of the people in the game.
@@ -474,7 +513,7 @@ mod tests {
     #[test]
     fn choose_opponent_lists_opponents() {
         let mut state = GameState::new_two_player(42);
-        let ability = make_choose_ability(ChoiceType::Opponent);
+        let ability = make_choose_ability(ChoiceType::Opponent { restriction: None });
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
         match &state.waiting_for {
@@ -520,20 +559,65 @@ mod tests {
     }
 
     #[test]
-    fn choose_player_with_all_players_chosen_offers_no_options() {
-        // Edge: when every player is already chosen, the option set is empty
-        // — the choice (and its dependent effect) does nothing.
+    fn choose_player_with_all_players_chosen_resolves_as_no_op() {
+        // CR 609.3 (issue #3040): when every eligible player is already chosen,
+        // the engine-enumerated option set is empty — choosing is impossible, so
+        // the choice does nothing and resolution continues. It must NOT raise a
+        // `WaitingFor::NamedChoice` with no options, which would wedge the game
+        // (the legal-action enumerator yields no `ChooseOption` to advance it).
         let mut state = GameState::new_two_player(42);
+        // A non-Priority sentinel so we can prove `resolve` doesn't install the
+        // empty `NamedChoice` and doesn't otherwise touch `waiting_for`.
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
         let mut ability = make_choose_ability(ChoiceType::Player);
         ability.chosen_players = vec![PlayerId(0), PlayerId(1)];
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
-        match &state.waiting_for {
-            WaitingFor::NamedChoice { options, .. } => {
-                assert!(options.is_empty());
-            }
-            other => panic!("Expected NamedChoice, got {:?}", other),
-        }
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::NamedChoice { .. }),
+            "an impossible choice must not wedge on an empty NamedChoice"
+        );
+        // The effect still resolved (CR 609.3 "as much as possible" = nothing).
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, GameEvent::EffectResolved { .. })));
+    }
+
+    #[test]
+    fn choose_empty_keyword_list_resolves_as_no_op() {
+        // CR 609.3 + CR 608.2d (issue #3040): "choose an ability the target has"
+        // with no removable abilities enumerates to an empty option set. The
+        // choice is impossible, so it resolves as a no-op rather than emitting an
+        // unsatisfiable `NamedChoice`.
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let ability = make_choose_ability(ChoiceType::Keyword { options: vec![] });
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::NamedChoice { .. }),
+            "an empty keyword choice must not wedge on an empty NamedChoice"
+        );
+    }
+
+    #[test]
+    fn choose_card_name_with_empty_options_still_prompts() {
+        // CR 609.3 boundary: `CardName` options are supplied by the frontend's
+        // card database at runtime, so an empty engine list is expected, not
+        // impossible. The no-op short-circuit must NOT fire here — the prompt
+        // still goes up so the player can name a card.
+        let mut state = GameState::new_two_player(42);
+        let ability = make_choose_ability(ChoiceType::CardName);
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::NamedChoice { .. }),
+            "CardName is player-supplied — empty engine options must still prompt"
+        );
     }
 
     #[test]

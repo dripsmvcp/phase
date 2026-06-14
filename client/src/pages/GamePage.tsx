@@ -15,12 +15,15 @@ import type { DeckCardCount, GameFormat, MatchConfig, SerializedAbilityCost } fr
 import { useDraftStore } from "../stores/draftStore";
 import { loadActiveQuickDraft } from "../services/quickDraftPersistence";
 import type { DraftMatchResult } from "../services/quickDraftPersistence";
-import { useIsCompactHeight } from "../hooks/useIsCompactHeight.ts";
+import { useResolvedGridRows } from "../hooks/useResolvedGridRows.ts";
 import { useIsMobile } from "../hooks/useIsMobile.ts";
+import { FlexEditOverlay } from "../components/flexlayout/FlexEditOverlay.tsx";
+import { DraggableWidget } from "../components/flexlayout/DraggableWidget.tsx";
 import { BetweenGamesSideboardModal } from "../components/multiplayer/BetweenGamesSideboardModal.tsx";
 import { audioManager } from "../audio/AudioManager.ts";
 import { useAudioContext } from "../audio/useAudioContext.ts";
 import { AnimationOverlay } from "../components/animation/AnimationOverlay.tsx";
+import { RevealOverlay } from "../components/animation/RevealOverlay.tsx";
 import { TurnBanner } from "../components/animation/TurnBanner.tsx";
 import { DiceRollOverlay } from "../components/animation/DiceRollOverlay.tsx";
 import { flashStartingPlayerContest } from "../game/diceContest.ts";
@@ -46,6 +49,7 @@ import { SandboxToolsNudge } from "../components/help/SandboxToolsNudge.tsx";
 import { HelpSheet } from "../components/help/HelpSheet.tsx";
 import { GameLogPanel } from "../components/log/GameLogPanel.tsx";
 import { ChooseXValueUI } from "../components/mana/ChooseXValueUI.tsx";
+import { AssistPaymentUI } from "../components/mana/AssistPaymentUI.tsx";
 import { ManaPaymentUI } from "../components/mana/ManaPaymentUI.tsx";
 import { PayAmountChoiceUI } from "../components/mana/PayAmountChoiceUI.tsx";
 import { RichLabel } from "../components/mana/RichLabel.tsx";
@@ -71,6 +75,7 @@ import { PeekTab } from "../components/modal/DialogShell.tsx";
 import { PeekRestoreTab } from "../components/modal/DialogHost.tsx";
 import { useModalPeek } from "../components/modal/useModalPeek.ts";
 import { BattleProtectorModal } from "../components/modal/BattleProtectorModal.tsx";
+import { AssistChoosePlayerModal } from "../components/modal/AssistChoosePlayerModal.tsx";
 import { ClashOpponentModal } from "../components/modal/ClashOpponentModal.tsx";
 import { TributeModal } from "../components/modal/TributeModal.tsx";
 import { CombatTaxModal } from "../components/modal/CombatTaxModal.tsx";
@@ -129,13 +134,21 @@ import { useSpectatorMode } from "../hooks/useSpectatorMode.ts";
 import { GameProvider } from "../providers/GameProvider.tsx";
 import { useCanActForWaitingState, usePerspectivePlayerId, usePlayerId } from "../hooks/usePlayerId.ts";
 import { abilityChoiceLabel, formatAbilityCost } from "../viewmodel/costLabel.ts";
-import { getWaitingForObjectChoiceIds } from "../viewmodel/gameStateView.ts";
+import {
+  getCastableZoneViewerTarget,
+  getWaitingForObjectChoiceIds,
+  type ZoneViewerTarget,
+} from "../viewmodel/gameStateView.ts";
 import { gameButtonClass } from "../components/ui/buttonStyles.ts";
 
 type ZoneRailStyle = CSSProperties & {
   "--card-w": string;
   "--card-h": string;
 };
+
+function castableZoneViewerAutoOpenKey(target: ZoneViewerTarget): string {
+  return `${target.zone}:${target.playerId}:${target.objectIds.join(",")}`;
+}
 
 /**
  * i18n keys for user-facing messages keyed by
@@ -707,8 +720,9 @@ function GamePageContent({
   const lobbyProgress = useGameStore((s) => s.lobbyProgress);
   const dispatch = useGameDispatch();
   const isMobile = useIsMobile();
-  const isCompactHeight = useIsCompactHeight();
+  const gridTemplateRows = useResolvedGridRows();
   const objects = useGameStore((s) => s.gameState?.objects);
+  const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
   const seatOrder = useGameStore((s) => s.gameState?.seat_order);
   const players = useGameStore((s) => s.gameState?.players);
   const eliminatedPlayers = useGameStore((s) => s.gameState?.eliminated_players);
@@ -748,7 +762,9 @@ function GamePageContent({
   const [viewingZone, setViewingZone] = useState<{
     zone: "graveyard" | "exile" | "library";
     playerId: number;
+    autoOpenKey?: string;
   } | null>(null);
+  const dismissedCastableZoneViewerKeyRef = useRef<string | null>(null);
   const [preferencesOpen, setPreferencesOpen] = useState<
     null | { tab?: SettingsTabId; highlight?: SettingsHighlight }
   >(null);
@@ -862,6 +878,9 @@ function GamePageContent({
 
   // Sync card size preference to CSS custom properties
   const cardSize = usePreferencesStore((s) => s.cardSize);
+  // Keys BattlefieldBackground so a mode/seat change remounts it with a fresh
+  // lock (see BattlefieldBackground) instead of resetting refs during render.
+  const boardBackground = usePreferencesStore((s) => s.boardBackground);
   useEffect(() => {
     const root = document.documentElement;
     const scale = cardSize === "small" ? 0.8 : cardSize === "large" ? 1.25 : 1;
@@ -875,11 +894,18 @@ function GamePageContent({
     }
   }, []);
 
-  // Auto-open graveyard/exile viewer when the engine is waiting for an object choice in that zone.
+  // Auto-open graveyard/exile viewer when the engine is waiting for an object
+  // choice in that zone, or when Priority surfaces cast/play actions on cards
+  // in a single graveyard/exile pile (Retrace, Flashback, etc.).
   useEffect(() => {
-    if (!objects) return;
+    if (!objects) {
+      dismissedCastableZoneViewerKeyRef.current = null;
+      return;
+    }
     const wf = engineWaitingFor;
-    if (!canActForWaitingState) return;
+    if (!canActForWaitingState) {
+      return;
+    }
 
     // Collect distinct (zone, owner) groupings so we don't trap the user in one
     // graveyard when the effect can target either player's graveyard (e.g. Soul-Guide Lantern).
@@ -896,9 +922,37 @@ function GamePageContent({
     // Only auto-open when there's a single zone+owner to open. Otherwise the
     // zone control glow prompts the user to pick.
     if (groups.size === 1 && firstHit) {
+      dismissedCastableZoneViewerKeyRef.current = null;
       setViewingZone(firstHit);
+      return;
     }
-  }, [canActForWaitingState, engineWaitingFor, objects]);
+
+    const castableTarget = getCastableZoneViewerTarget(
+      wf,
+      objects,
+      legalActionsByObject,
+    );
+    if (castableTarget) {
+      const autoOpenKey = castableZoneViewerAutoOpenKey(castableTarget);
+      if (dismissedCastableZoneViewerKeyRef.current !== autoOpenKey) {
+        setViewingZone({
+          zone: castableTarget.zone,
+          playerId: castableTarget.playerId,
+          autoOpenKey,
+        });
+      }
+      return;
+    }
+
+    dismissedCastableZoneViewerKeyRef.current = null;
+  }, [canActForWaitingState, engineWaitingFor, legalActionsByObject, objects]);
+
+  const handleZoneViewerClose = useCallback(() => {
+    if (viewingZone?.autoOpenKey) {
+      dismissedCastableZoneViewerKeyRef.current = viewingZone.autoOpenKey;
+    }
+    setViewingZone(null);
+  }, [viewingZone]);
 
   const handleDeclareCompanion = useCallback(
     (cardIndex: number | null) => {
@@ -1032,7 +1086,7 @@ function GamePageContent({
       }}
     >
       <SpectatorChrome />
-      <BattlefieldBackground />
+      <BattlefieldBackground key={`${boardBackground}-${playerId}`} />
       <StackDisplay />
 
       {/* Persistent Sandbox banner — visible to all players whenever the
@@ -1079,18 +1133,21 @@ function GamePageContent({
         className={`relative z-10 grid min-w-0 h-full${isReconnecting ? " pointer-events-none" : ""}`}
         style={{
           paddingTop: "var(--game-top-overlay-offset, 0px)",
-          gridTemplateRows: isCompactHeight
-            ? "minmax(0,12%) 1fr minmax(0,18%)"
-            : "minmax(0,min(12%,100px)) 1fr minmax(0,min(18%,150px))",
+          gridTemplateRows,
           gridTemplateColumns: "1fr",
         }}
       >
         {/* Row 1: Opponent hand + zone piles (flow layout — piles take real space) */}
-        <div className="relative z-20 min-w-0 flex w-full overflow-visible">
+        <div
+          className="relative z-20 min-w-0 flex w-full overflow-visible"
+          data-flex-zone="opp-row"
+        >
           <div className="min-w-0 flex-1">
             <OpponentHand showCards={showAiHand} />
           </div>
-          <div
+          <DraggableWidget
+            target={{ kind: "widget", key: "opponentPiles" }}
+            flexZone="opponentPiles"
             className="flex shrink-0 items-start gap-1.5 px-1 py-1"
             style={playerZoneRailStyle}
           >
@@ -1111,7 +1168,7 @@ function GamePageContent({
                 setViewingZone({ zone: "graveyard", playerId: activeOpponentId })
               }
             />
-          </div>
+          </DraggableWidget>
         </div>
 
         {/* Row 2: Battlefield — takes remaining space; HUDs passed inline to PlayerAreas */}
@@ -1119,16 +1176,35 @@ function GamePageContent({
           <GameBoard oppHud={oppHud} playerHud={playerHud} />
         </div>
 
-        {/* Row 3: Player hand + zones */}
-        <div className="relative min-w-0 overflow-visible">
+        {/* Row 3: Player hand + zones. The hand is top-anchored in this row, so
+            if the row stretched with its (resizable) band track, resizing the
+            band would drag the hand vertically. Instead we give the row a
+            CONSTANT height equal to the DEFAULT band and pin it to the track's
+            bottom (`self-end`, the viewport edge, which never moves). The height
+            mirrors the resolver's default track exactly — `min(18%, 150px)` of
+            the grid's CONTENT box (`100dvh` minus the top-overlay padding) — but
+            computed in viewport units so it ignores the LIVE (resized) track,
+            which a plain `18%` on a grid item would track instead. The hand thus
+            keeps its default resting position and stays put on resize; a grown
+            band opens empty space ABOVE the row (trading with the battlefield)
+            rather than shoving the hand up. */}
+        <div
+          className="relative min-w-0 self-end overflow-visible"
+          style={{ height: "min(calc(0.18 * (100dvh - var(--game-top-overlay-offset, 0px))), 150px)" }}
+          data-flex-zone="player-row"
+        >
           <div className="flex items-end justify-center">
             <ZoneHand zone="exile" />
             <PlayerHand />
             <ZoneHand zone="graveyard" />
           </div>
-          <div
+          <DraggableWidget
+            target={{ kind: "widget", key: "playerPiles" }}
+            flexZone="playerPiles"
+            scaleKey="playerPiles"
             className="pointer-events-none absolute left-0 top-0 bottom-0 z-10 flex w-fit flex-col items-start justify-end gap-0.5 p-1 lg:gap-1 lg:p-3 [&>*]:pointer-events-auto [&>div>*]:pointer-events-auto"
-            style={playerZoneRailStyle}
+            // Anchor box-scale to the bottom-left dock corner.
+            style={{ ...playerZoneRailStyle, transformOrigin: "bottom left" }}
           >
             <div className="flex items-end gap-2">
               <ExilePile
@@ -1147,7 +1223,7 @@ function GamePageContent({
                 onView={() => setViewingZone({ zone: "library", playerId: perspectivePlayerId })}
               />
             </div>
-          </div>
+          </DraggableWidget>
           <div
             className="pointer-events-none absolute right-0 top-0 bottom-0 z-10 flex w-fit flex-col items-end justify-end gap-0.5 p-1 lg:gap-1 lg:p-3 [&>*]:pointer-events-auto"
             style={playerZoneRailStyle}
@@ -1158,11 +1234,17 @@ function GamePageContent({
       </div>
 
       {/* Right-side fixed UI stack: combat phases → full control → action buttons → log */}
-      <div
+      <DraggableWidget
+        target={{ kind: "widget", key: "actionRail" }}
+        flexZone="actionRail"
+        scaleKey="actionRail"
+        resizeCorner="bl"
         className="fixed z-30 flex flex-col items-end gap-1.5"
         style={{
           bottom: "calc(env(safe-area-inset-bottom) + var(--action-btn-bottom))",
           right: "calc(env(safe-area-inset-right) + var(--game-edge-right) + var(--game-right-rail-offset, 0px))",
+          // Anchor box-scale to the docked corner so it grows inward, not off-screen.
+          transformOrigin: "bottom right",
         }}
       >
         {showFlowHelpNudge && <FlowHelpNudge />}
@@ -1177,10 +1259,11 @@ function GamePageContent({
             <ActionButton />
           </>
         )}
-      </div>
+      </DraggableWidget>
 
       <GameLogPanel />
       <MobileHandDrawer />
+      <FlexEditOverlay />
 
       {/* Game menu — top-left hamburger */}
       <GameMenu
@@ -1324,14 +1407,6 @@ function GamePageContent({
       <DebugPanel />
       <ResolutionProgressOverlay />
 
-      {viewingZone && (
-        <ZoneViewer
-          zone={viewingZone.zone}
-          playerId={viewingZone.playerId}
-          onClose={() => setViewingZone(null)}
-        />
-      )}
-
       {preferencesOpen && (
         <PreferencesModal
           onClose={() => setPreferencesOpen(null)}
@@ -1348,6 +1423,7 @@ function GamePageContent({
           onChangeBackground={() =>
             setPreferencesOpen({ tab: "gameplay", highlight: "board-background" })
           }
+          onCustomizeLayout={() => useUiStore.getState().setFlexEditMode(true)}
           onToggleGameLog={() => useUiStore.getState().toggleLogPanel()}
           onToggleDebugLog={() => useUiStore.getState().toggleDebugPanel()}
         />
@@ -1358,6 +1434,8 @@ function GamePageContent({
 
       {/* Animation overlay (above board, below modals) */}
       <AnimationOverlay containerRef={containerRef} />
+      {/* Multi-card top-of-library reveal (CR 701.20b), e.g. Lead the Stampede */}
+      <RevealOverlay />
       <TurnBanner />
       <DiceRollOverlay />
 
@@ -1388,11 +1466,14 @@ function GamePageContent({
           canActForWaitingState && <ChooseXValueUI />}
         {waitingFor?.type === "PayAmountChoice" &&
           canActForWaitingState && <PayAmountChoiceUI />}
+        {waitingFor?.type === "AssistPayment" &&
+          canActForWaitingState && <AssistPaymentUI />}
         {waitingFor?.type === "ReplacementChoice" &&
           canActForWaitingState && <ReplacementModal />}
         {waitingFor?.type === "OrderTriggers" &&
           canActForWaitingState && <TriggerOrderModal />}
         <BattleProtectorModal />
+        <AssistChoosePlayerModal />
         <ClashOpponentModal />
         <TributeModal />
         <CombatTaxModal />
@@ -1471,6 +1552,12 @@ function GamePageContent({
             <ExertChoiceModal />
           )}
 
+        {/* CR 702.154a: Optional Enlist tap choice during declare attackers. */}
+        {waitingFor?.type === "EnlistChoice" &&
+          canActForWaitingState && (
+            <EnlistChoiceModal />
+          )}
+
         {/* Unless payment choice ("Counter unless you pay {X}") */}
         {waitingFor?.type === "UnlessPayment" &&
           canActForWaitingState && (
@@ -1487,6 +1574,16 @@ function GamePageContent({
             <ActivationCostOneOfChoiceModal />
           )}
       </DialogHost>
+
+      {/* Graveyard/exile viewer mounts after DialogHost so its z-[60] shell
+          paints above prompt overlays (issue #2387: retrace / graveyard cast). */}
+      {viewingZone && (
+        <ZoneViewer
+          zone={viewingZone.zone}
+          playerId={viewingZone.playerId}
+          onClose={handleZoneViewerClose}
+        />
+      )}
 
       {waitingFor?.type === "CompanionReveal" &&
         waitingFor.data.player === playerId && (
@@ -2687,6 +2784,55 @@ function ExertChoiceModal() {
         dispatch({
           type: "ChooseExert",
           data: { exert: id === "exert" },
+        })
+      }
+    />
+  );
+}
+
+// ── Enlist Choice Modal (CR 702.154a: enlist as it attacks) ─────────────
+
+function EnlistChoiceModal() {
+  const { t } = useTranslation("game");
+  const dispatch = useGameDispatch();
+  const waitingFor = useGameStore((s) => s.gameState?.waiting_for);
+  const objects = useGameStore((s) => s.gameState?.objects);
+
+  if (waitingFor?.type !== "EnlistChoice") return null;
+
+  const attackerId = waitingFor.data.attacker;
+  const attacker = objects?.[attackerId];
+  const attackerName = attacker?.name ?? t("gamePage.enlist.attackerFallback");
+  const creatureFallback = t("gamePage.enlist.creatureFallback");
+  const options = [
+    ...waitingFor.data.eligible.map((id) => {
+      const enlisted = objects?.[id];
+      const name = enlisted?.name ?? creatureFallback;
+      return {
+        id: String(id),
+        label: name,
+        description: t("gamePage.enlist.tapDescription", { name, attacker: attackerName }),
+      };
+    }),
+    {
+      id: "decline",
+      label: t("gamePage.enlist.decline"),
+      description: t("gamePage.enlist.declineDescription", { attacker: attackerName }),
+    },
+  ];
+
+  return (
+    <ChoiceModal
+      title={t("gamePage.enlist.title", { name: attackerName })}
+      subtitle={t("gamePage.enlist.subtitle")}
+      previewCardName={attacker?.name}
+      previewCardTypes={attacker?.card_types}
+      previewObjectId={attackerId}
+      options={options}
+      onChoose={(id) =>
+        dispatch({
+          type: "ChooseEnlist",
+          data: { target: id === "decline" ? null : Number(id) },
         })
       }
     />

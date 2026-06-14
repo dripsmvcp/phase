@@ -60,7 +60,8 @@ use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::keywords::{has_flash, has_keyword};
 use engine::game::quantity::resolve_quantity;
 use engine::types::ability::{
-    ContinuousModification, Duration, Effect, QuantityExpr, StaticDefinition, TargetFilter,
+    ContinuousModification, Duration, Effect, EffectScope, QuantityExpr, StaticDefinition,
+    TapStateChange, TargetFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
@@ -76,6 +77,8 @@ use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::cast_facts::collect_definition_effects;
 use crate::features::DeckFeatures;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 /// Life threshold at which further life gain is treated as redundant.
 /// Chosen well above any opening-life total (20) so we never penalise early
@@ -269,8 +272,19 @@ fn redundancy_delta(
     origin: EffectOrigin,
 ) -> Option<(f64, i64, i64)> {
     match effect {
-        Effect::Tap { target } => tap_redundancy(state, source_id, target),
-        Effect::Untap { target } => untap_redundancy(state, source_id, target),
+        // CR 701.26a/b: single-target tap/untap have redundancy checks; the
+        // mass (`All`) scope has none (see the no-op list below), matching the
+        // legacy `Tap`/`Untap` vs `TapAll`/`UntapAll` split.
+        Effect::SetTapState {
+            target,
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
+        } => tap_redundancy(state, source_id, target),
+        Effect::SetTapState {
+            target,
+            scope: EffectScope::Single,
+            state: TapStateChange::Untap,
+        } => untap_redundancy(state, source_id, target),
         Effect::Pump {
             power,
             toughness,
@@ -302,7 +316,7 @@ fn redundancy_delta(
         // broader "+1/+1 counters are almost always beneficial" / diminishing-
         // returns case remains deferred (see module TODOs) — only this strictly
         // redundant zero-count sub-case fires here.
-        Effect::AddCounter { count, .. } => zero_quantity_redundancy(
+        Effect::PutCounter { count, .. } => zero_quantity_redundancy(
             state,
             source_id,
             ai_player,
@@ -350,8 +364,12 @@ fn redundancy_delta(
         | Effect::Counter { .. }
         | Effect::Token { .. }
         | Effect::LoseLife { .. }
-        | Effect::TapAll { .. }
-        | Effect::UntapAll { .. }
+        // CR 701.26a/b: mass tap/untap (legacy `TapAll`/`UntapAll`) has no
+        // shipped redundancy check.
+        | Effect::SetTapState {
+            scope: EffectScope::All,
+            ..
+        }
         | Effect::RemoveCounter { .. }
         | Effect::Sacrifice { .. }
         | Effect::DiscardCard { .. }
@@ -367,6 +385,7 @@ fn redundancy_delta(
         | Effect::ChangeZoneAll { .. }
         | Effect::Dig { .. }
         | Effect::GainControl { .. }
+        | Effect::GainControlAll { .. }
         | Effect::ControlNextTurn { .. }
         | Effect::Attach { .. }
         | Effect::UnattachAll { .. }
@@ -393,6 +412,9 @@ fn redundancy_delta(
         // CR 702.141a: Encore makes per-opponent copy tokens — like Myriad, it is
         // not a "redundant if already controlled" effect.
         | Effect::Encore
+        // CR 701.42a: Meld exiles both halves of a meld pair and materializes a
+        // single combined permanent — not a "redundant if already controlled" one.
+        | Effect::Meld { .. }
         // CR 702.75a: HideawayConceal is an internal continuation step of the
         // Hideaway ETB trigger (turn the just-exiled card face down + link it);
         // it is never independently chosen, so it carries no redundancy signal.
@@ -401,10 +423,14 @@ fn redundancy_delta(
         // target creature) is a triggered death/resolution effect, not a
         // "redundant if already controlled" one.
         | Effect::ExileHaunting { .. }
+        // CR 614.1a + CR 607.2b: Rod of Absorption's trigger stamps a resolving
+        // spell with an exile-instead/linked-source rider. Its value is realized
+        // by the stack resolution replacement path, so this policy has no static
+        // redundancy signal to score.
+        | Effect::ExileResolvingSpellInsteadOfGraveyard
         | Effect::CopyTokenBlockingAttacker { .. }
         | Effect::BecomeCopy { .. }
         | Effect::ChooseCard { .. }
-        | Effect::PutCounter { .. }
         | Effect::PutCounterAll { .. }
         | Effect::MultiplyCounter { .. }
         | Effect::DoublePT { .. }
@@ -452,6 +478,7 @@ fn redundancy_delta(
         | Effect::VentureIntoDungeon
         | Effect::VentureInto { .. }
         | Effect::TakeTheInitiative
+        | Effect::Planeswalk
         | Effect::GrantCastingPermission { .. }
         | Effect::ChooseFromZone { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
@@ -472,6 +499,8 @@ fn redundancy_delta(
         | Effect::ChangeTargets { .. }
         | Effect::Manifest { .. }
         | Effect::ManifestDread
+        | Effect::Cloak { .. }
+        | Effect::TurnFaceUp { .. }
         | Effect::ExtraTurn { .. }
         | Effect::GrantExtraLoyaltyActivations { .. }
         | Effect::SkipNextTurn { .. }
@@ -1099,8 +1128,10 @@ mod tests {
         let obj_id = make_creature_with_ability(
             &mut state,
             "Tapper",
-            Effect::Tap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
             },
         );
         state.objects.get_mut(&obj_id).unwrap().tapped = true;
@@ -1123,8 +1154,10 @@ mod tests {
         let obj_id = make_creature_with_ability(
             &mut state,
             "Tapper",
-            Effect::Tap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
             },
         );
         // default tapped = false
@@ -1147,8 +1180,10 @@ mod tests {
         let obj_id = make_creature_with_ability(
             &mut state,
             "Untapper",
-            Effect::Untap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Untap,
             },
         );
         // default tapped = false -- so untap is a no-op on this target set
@@ -1171,8 +1206,10 @@ mod tests {
         let obj_id = make_creature_with_ability(
             &mut state,
             "Untapper",
-            Effect::Untap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Untap,
             },
         );
         state.objects.get_mut(&obj_id).unwrap().tapped = true;
@@ -1252,7 +1289,7 @@ mod tests {
         let obj_id = make_creature_with_ability(
             &mut state,
             "Zero Counters",
-            Effect::AddCounter {
+            Effect::PutCounter {
                 counter_type: CounterType::Plus1Plus1,
                 count: QuantityExpr::Fixed { value: 0 },
                 target: TargetFilter::SelfRef,
@@ -1279,7 +1316,7 @@ mod tests {
         let obj_id = make_creature_with_ability(
             &mut state,
             "Real Counters",
-            Effect::AddCounter {
+            Effect::PutCounter {
                 counter_type: CounterType::Plus1Plus1,
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::SelfRef,
@@ -1824,6 +1861,8 @@ mod tests {
                 object_id,
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -1881,8 +1920,10 @@ mod tests {
         let _other = make_creature_with_ability(
             &mut state,
             "Other Creature",
-            Effect::Tap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
             },
         );
 

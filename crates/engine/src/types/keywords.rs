@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use super::ability::ControllerRef;
 use super::ability::{
-    AbilityCost, Comparator, CostObjectCount, FilterProp, QuantityExpr, TargetFilter, TypeFilter,
-    TypedFilter,
+    AbilityCost, ActivationRestriction, Comparator, CostObjectCount, FilterProp, QuantityExpr,
+    TargetFilter, TypeFilter, TypedFilter,
 };
 use super::counter::{parse_counter_type, CounterType};
 use super::mana::{ManaColor, ManaCost};
@@ -95,6 +95,23 @@ pub enum EvokeCost {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum EchoCost {
+    Mana(ManaCost),
+    NonMana(AbilityCost),
+}
+
+/// CR 702.103a + CR 118.9: Bestow cost — the alternative cost paid to cast the
+/// card as an Aura. Classic Theros bestow uses a pure mana cost (e.g. Boon Satyr
+/// "Bestow {3}{G}{G}"). Murders at Karlov Manor reprints introduced compound
+/// bestow costs with a non-mana rider ("Bestow—{R}, Collect evidence 6." on
+/// Detective's Phoenix), where the residual non-mana sub-cost is paid alongside
+/// the mana sub-cost. Mirrors `EvokeCost`/`FlashbackCost`/`CyclingCost` so the
+/// non-mana portion composes through the existing `AbilityCost` /
+/// `pay_additional_cost` pipeline. `split_bestow_cost_components` (casting.rs)
+/// separates the mana sub-cost (paid via the normal mana flow, CR 601.2g) from
+/// the residual non-mana sub-cost (paid via `pay_additional_cost`, CR 601.2h).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum BestowCost {
     Mana(ManaCost),
     NonMana(AbilityCost),
 }
@@ -196,6 +213,8 @@ pub enum KeywordKind {
     Escape,
     Morph,
     Megamorph,
+    /// CR 702.187: Mayhem — see `Keyword::Mayhem`.
+    Mayhem,
     Suspend,
     Blitz,
     Disturb,
@@ -207,7 +226,6 @@ pub enum KeywordKind {
     Dash,
     Craft,
     Harmonize,
-    Mayhem,
     Warp,
     Devour,
     Offspring,
@@ -431,17 +449,6 @@ pub enum BloodthirstValue {
     X,
 }
 
-/// CR 602.5b: Activation-frequency restriction on an activated-ability-like
-/// action (e.g. Crew). `OncePerTurn` models "Activate only once each turn";
-/// `Unlimited` is the default with no restriction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(tag = "type", content = "data")]
-pub enum ActivationCadence {
-    #[default]
-    Unlimited,
-    OncePerTurn,
-}
-
 /// All MTG keywords as typed enum variants.
 /// Simple (unit) variants for keywords with no parameters.
 /// Parameterized variants carry associated data (ManaCost for costs, amounts, etc.).
@@ -548,7 +555,7 @@ pub enum Keyword {
     /// colorless Hero creature token, then attach this Equipment to it."
     JobSelect,
     TotemArmor,
-    Bestow(ManaCost),
+    Bestow(BestowCost),
 
     // Graveyard
     Embalm(EmbalmCost),
@@ -570,10 +577,13 @@ pub enum Keyword {
     Absorb(u32),
     /// CR 702.122 (Crew) + CR 602.5b: `power` is the total power required to
     /// crew; `once_per_turn` carries an optional "Activate only once each turn"
-    /// restriction.
+    /// restriction (`Some(ActivationRestriction::OnlyOnceEachTurn)`), or `None`
+    /// for the unrestricted default. Boxed to break the
+    /// `Keyword → ActivationRestriction → ParsedCondition → Keyword` size cycle
+    /// (`ParsedCondition::SourceLacksKeyword` holds a `Keyword` by value).
     Crew {
         power: u32,
-        once_per_turn: ActivationCadence,
+        once_per_turn: Option<Box<ActivationRestriction>>,
     },
     /// CR 702.124: Partner and its variant keywords for co-commander pairing.
     Partner(PartnerType),
@@ -588,6 +598,9 @@ pub enum Keyword {
     Prowl(ManaCost),
     Morph(ManaCost),
     Megamorph(ManaCost),
+    /// CR 702.187b: Mayhem {cost} — cast from graveyard if you discarded this
+    /// card this turn, paying the mayhem cost rather than its mana cost.
+    Mayhem(ManaCost),
     Madness(ManaCost),
     /// CR 702.94a: Miracle {cost} — static ability linked (CR 603.11) to a
     /// triggered ability. Static: "You may reveal this card from your hand as
@@ -611,11 +624,6 @@ pub enum Keyword {
     /// CR 702.180: Harmonize {cost} — cast from graveyard for harmonize cost,
     /// tap up to one creature to reduce cost by its power, exile on resolution.
     Harmonize(ManaCost),
-    /// CR 702.187b: Mayhem {cost} — "As long as you discarded this card this
-    /// turn, you may cast it from your graveyard by paying [cost] rather than
-    /// paying its mana cost." Unlike Flashback/Harmonize, the spell is NOT
-    /// exiled on resolution — it resolves normally (like Escape).
-    Mayhem(ManaCost),
     /// CR 702.74a + CR 118.9: see `EvokeCost` for the mana / non-mana split.
     /// Pure-mana evoke (Lorwyn cycle) is `EvokeCost::Mana`; MH2 Incarnations
     /// (Solitude et al.) carry `EvokeCost::NonMana(AbilityCost::Exile { .. })`.
@@ -1086,6 +1094,7 @@ impl Keyword {
             Keyword::Escape { .. } => KeywordKind::Escape,
             Keyword::Morph(_) => KeywordKind::Morph,
             Keyword::Megamorph(_) => KeywordKind::Megamorph,
+            Keyword::Mayhem(_) => KeywordKind::Mayhem,
             Keyword::Suspend { .. } => KeywordKind::Suspend,
             Keyword::Blitz(_) => KeywordKind::Blitz,
             Keyword::Disturb(_) => KeywordKind::Disturb,
@@ -1097,7 +1106,6 @@ impl Keyword {
             Keyword::Dash(_) => KeywordKind::Dash,
             Keyword::Craft { .. } => KeywordKind::Craft,
             Keyword::Harmonize(_) => KeywordKind::Harmonize,
-            Keyword::Mayhem(_) => KeywordKind::Mayhem,
             Keyword::Warp(_) => KeywordKind::Warp,
             Keyword::Devour(_) => KeywordKind::Devour,
             Keyword::Offspring(_) => KeywordKind::Offspring,
@@ -1200,6 +1208,67 @@ impl Keyword {
             | Keyword::Toxic(_)
             | Keyword::WebSlinging(_) => KeywordKind::Unknown,
         }
+    }
+
+    /// CR 601.2f + CR 707.2: Keywords that only function while a player is
+    /// casting a spell. A token created by `CopyTokenOf` was not cast, so these
+    /// keywords are inert on the copy and are stripped at creation time so the
+    /// token does not display cast-only reminders (Offspring, Kicker, etc.).
+    ///
+    /// Maintenance note: every new alternative-cost or additional-cost casting
+    /// keyword added to `Keyword` must also be added here, or token copies of
+    /// permanents carrying it re-introduce the inert-reminder display bug.
+    ///
+    /// Deliberately excluded: `Prototype` — CR 718.2a makes the alternative
+    /// characteristics part of the object's copiable values and CR 718.3d
+    /// treats a copy of a prototyped permanent as itself prototyped, so the
+    /// keyword must survive copying.
+    pub fn is_spell_casting_only(&self) -> bool {
+        matches!(
+            self,
+            Keyword::Offspring(_)
+                | Keyword::Kicker(_)
+                | Keyword::Buyback(_)
+                | Keyword::Flashback(_)
+                | Keyword::Retrace
+                | Keyword::Blitz(_)
+                | Keyword::Dash(_)
+                | Keyword::Sneak(_)
+                | Keyword::Ninjutsu(_)
+                | Keyword::Mutate(_)
+                | Keyword::Escape { .. }
+                | Keyword::Foretell(_)
+                | Keyword::Plot(_)
+                | Keyword::Miracle(_)
+                | Keyword::Gift(_)
+                | Keyword::Bargain
+                | Keyword::Replicate(_)
+                | Keyword::Squad(_)
+                | Keyword::Conspire
+                | Keyword::Harmonize(_)
+                | Keyword::Casualty(_)
+                | Keyword::Aftermath
+                | Keyword::Disturb(_)
+                | Keyword::JumpStart
+                | Keyword::Cipher
+                | Keyword::Evoke(_)
+                | Keyword::Emerge(_)
+                | Keyword::Bestow(_)
+                | Keyword::Madness(_)
+                | Keyword::Suspend { .. }
+                | Keyword::Morph(_)
+                | Keyword::Megamorph(_)
+                | Keyword::Disguise(_)
+                | Keyword::Spectacle(_)
+                | Keyword::Surge(_)
+                | Keyword::Overload(_)
+                | Keyword::Splice { .. }
+                | Keyword::Escalate(_)
+                | Keyword::Prowl(_)
+                | Keyword::Impending { .. }
+                | Keyword::MoreThanMeetsTheEye(_)
+                | Keyword::Freerunning(_)
+        )
     }
 
     /// CR 113.2c: keywords whose multiple instances each function separately AND
@@ -1715,7 +1784,7 @@ impl FromStr for Keyword {
                 "crew" => {
                     return Ok(Keyword::Crew {
                         power: p.parse().unwrap_or(1),
-                        once_per_turn: ActivationCadence::Unlimited,
+                        once_per_turn: None,
                     });
                 }
                 "partner" => return Ok(Keyword::Partner(PartnerType::With(p.clone()))),
@@ -1732,7 +1801,11 @@ impl FromStr for Keyword {
                 "tribute" => return Ok(Keyword::Tribute(p.parse().unwrap_or(1))),
                 "afterlife" => return Ok(Keyword::Afterlife(p.parse().unwrap_or(1))),
                 "reconfigure" => return Ok(Keyword::Reconfigure(parse_keyword_mana_cost(p))),
-                "bestow" => return Ok(Keyword::Bestow(parse_keyword_mana_cost(p))),
+                "bestow" => {
+                    return Ok(Keyword::Bestow(BestowCost::Mana(parse_keyword_mana_cost(
+                        p,
+                    ))))
+                }
                 "embalm" => {
                     return Ok(Keyword::Embalm(EmbalmCost::Mana(parse_keyword_mana_cost(
                         p,
@@ -1747,14 +1820,12 @@ impl FromStr for Keyword {
                 "prowl" => return Ok(Keyword::Prowl(parse_keyword_mana_cost(p))),
                 "morph" => return Ok(Keyword::Morph(parse_keyword_mana_cost(p))),
                 "megamorph" => return Ok(Keyword::Megamorph(parse_keyword_mana_cost(p))),
+                "mayhem" => return Ok(Keyword::Mayhem(parse_keyword_mana_cost(p))),
                 "madness" => return Ok(Keyword::Madness(parse_keyword_mana_cost(p))),
                 "miracle" => return Ok(Keyword::Miracle(parse_keyword_mana_cost(p))),
                 "dash" => return Ok(Keyword::Dash(parse_keyword_mana_cost(p))),
                 "emerge" => return Ok(Keyword::Emerge(parse_keyword_mana_cost(p))),
                 "harmonize" => return Ok(Keyword::Harmonize(parse_keyword_mana_cost(p))),
-                // CR 702.187b: Mayhem {cost} — cast from graveyard if discarded
-                // this turn for the mayhem (mana) cost.
-                "mayhem" => return Ok(Keyword::Mayhem(parse_keyword_mana_cost(p))),
                 "escape" => {
                     return Ok(Keyword::Escape {
                         cost: parse_keyword_mana_cost(p),
@@ -2322,6 +2393,25 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
     fn uint(v: &serde_json::Value) -> u32 {
         v.as_u64().unwrap_or(0) as u32
     }
+    // CR 602.5b: Crew's `once_per_turn` cadence. Accepts the current
+    // `Option<ActivationRestriction>` shape (`null` / `{"type":"OnlyOnceEachTurn"}`)
+    // and the legacy `ActivationCadence` tagged shape
+    // (`{"type":"Unlimited"}` / `{"type":"OncePerTurn"}`), mapping both to
+    // `Some(ActivationRestriction::OnlyOnceEachTurn)` for the once-each-turn case.
+    fn crew_cadence_from_value(
+        v: &serde_json::Value,
+    ) -> Result<Option<Box<ActivationRestriction>>, String> {
+        if v.is_null() {
+            return Ok(None);
+        }
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("Unlimited") => Ok(None),
+            Some("OncePerTurn") => Ok(Some(Box::new(ActivationRestriction::OnlyOnceEachTurn))),
+            _ => serde_json::from_value::<ActivationRestriction>(v.clone())
+                .map(|r| Some(Box::new(r)))
+                .map_err(|e| format!("Crew once_per_turn: {e}")),
+        }
+    }
     fn bloodthirst(v: &serde_json::Value) -> Result<BloodthirstValue, String> {
         if let Some(s) = v.as_str() {
             Ok(parse_bloodthirst_value(s))
@@ -2500,7 +2590,15 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         "Ninjutsu" => Ok(Keyword::Ninjutsu(mana(data)?)),
         "CommanderNinjutsu" => Ok(Keyword::CommanderNinjutsu(mana(data)?)),
         "Reconfigure" => Ok(Keyword::Reconfigure(mana(data)?)),
-        "Bestow" => Ok(Keyword::Bestow(mana(data)?)),
+        "Bestow" => {
+            // Accept both the legacy bare ManaCost format and the new tagged
+            // BestowCost format (Mana / NonMana) — mirrors Flashback/Embalm.
+            if let Ok(bestow_cost) = serde_json::from_value::<BestowCost>(data.clone()) {
+                Ok(Keyword::Bestow(bestow_cost))
+            } else {
+                Ok(Keyword::Bestow(BestowCost::Mana(mana(data)?)))
+            }
+        }
         "Embalm" => {
             // Accept both legacy ManaCost format and new EmbalmCost tagged format.
             if let Ok(embalm_cost) = serde_json::from_value::<EmbalmCost>(data.clone()) {
@@ -2521,6 +2619,9 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         "Prowl" => Ok(Keyword::Prowl(mana(data)?)),
         "Morph" => Ok(Keyword::Morph(mana(data)?)),
         "Megamorph" => Ok(Keyword::Megamorph(mana(data)?)),
+        // CR 702.187b: MTGJSON may provide bare "Mayhem"; the Oracle parser
+        // overwrites with the real mana cost extracted from reminder text.
+        "Mayhem" => Ok(Keyword::Mayhem(mana(data)?)),
         "Madness" => Ok(Keyword::Madness(mana(data)?)),
         "Miracle" => Ok(Keyword::Miracle(mana(data)?)),
         "Dash" => Ok(Keyword::Dash(mana(data)?)),
@@ -2528,9 +2629,6 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         // CR 702.138: MTGJSON provides bare "Escape" with no structured cost data.
         // Placeholder values — the Oracle parser overwrites with real cost/exile_count.
         "Harmonize" => Ok(Keyword::Harmonize(mana(data)?)),
-        // CR 702.187b: MTGJSON may provide bare "Mayhem"; the Oracle parser
-        // overwrites with the real mana cost extracted from reminder text.
-        "Mayhem" => Ok(Keyword::Mayhem(mana(data)?)),
         "Escape" => Ok(Keyword::Escape {
             cost: ManaCost::default(),
             exile_count: 0,
@@ -2721,10 +2819,9 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
                 let power = obj.get("power").map(uint).unwrap_or(1);
                 let once_per_turn = obj
                     .get("once_per_turn")
-                    .map(|v| serde_json::from_value(v.clone()))
-                    .transpose()
-                    .map_err(|e| format!("ActivationCadence: {e}"))?
-                    .unwrap_or(ActivationCadence::Unlimited);
+                    .map(crew_cadence_from_value)
+                    .transpose()?
+                    .flatten();
                 Ok(Keyword::Crew {
                     power,
                     once_per_turn,
@@ -2732,7 +2829,7 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
             } else {
                 Ok(Keyword::Crew {
                     power: uint(data),
-                    once_per_turn: ActivationCadence::Unlimited,
+                    once_per_turn: None,
                 })
             }
         }
@@ -3070,7 +3167,7 @@ mod tests {
             Keyword::from_str("Crew:3").unwrap(),
             Keyword::Crew {
                 power: 3,
-                once_per_turn: ActivationCadence::Unlimited
+                once_per_turn: None
             }
         );
         assert_eq!(Keyword::from_str("Rampage:2").unwrap(), Keyword::Rampage(2));

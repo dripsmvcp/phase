@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { ObjectId, PlayerId } from "../adapter/types.ts";
+import { objectAnchorSelector } from "../utils/objectAnchorSelector.ts";
 
 export interface Pos {
   x: number;
@@ -47,7 +48,7 @@ export function arcPath(from: Pos, to: Pos): string {
 function targetSelector(target: AttackerArrowTarget): string {
   return target.kind === "player"
     ? `[data-player-hud="${target.playerId}"]`
-    : `[data-object-id="${target.objectId}"]`;
+    : objectAnchorSelector(target.objectId);
 }
 
 function targetKey(target: AttackerArrowTarget): string {
@@ -90,7 +91,7 @@ export function useAttackerArrowPositions(
         const fromKey = `o:${a.attackerId}`;
         const toKey = targetKey(a.target);
         if (!current.has(fromKey)) {
-          const el = document.querySelector(`[data-object-id="${a.attackerId}"]`);
+          const el = document.querySelector(objectAnchorSelector(a.attackerId));
           if (el) current.set(fromKey, el.getBoundingClientRect());
         }
         if (!current.has(toKey)) {
@@ -152,11 +153,16 @@ export function useAttackerArrowPositions(
     restartPolling();
     window.addEventListener("resize", restartPolling);
     window.visualViewport?.addEventListener("resize", restartPolling);
+    // Capture-phase `scroll` catches scrolling inside inner containers (e.g. the
+    // crowded-creature overflow grid) where attacker/target cards move but
+    // `resize` never fires; without it, stabilized arrow endpoints desync.
+    window.addEventListener("scroll", restartPolling, true);
 
     return () => {
       if (rafId !== 0) cancelAnimationFrame(rafId);
       window.removeEventListener("resize", restartPolling);
       window.visualViewport?.removeEventListener("resize", restartPolling);
+      window.removeEventListener("scroll", restartPolling, true);
     };
   }, [arrows]);
 

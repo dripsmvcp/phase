@@ -48,6 +48,12 @@ fn players_for_filter(
             .filter(|player| player.id != controller && player.life_gained_this_turn > 0)
             .map(|player| player.id)
             .collect(),
+        // CR 104.5 / CR 800.4: Players who lost have left the game; this
+        // filter is quantity-only and has no live speed-effect recipient.
+        PlayerFilter::HasLostTheGame => Vec::new(),
+        // CR 506.2 + CR 508.6: Count-only filter (Suppressor Skyguard); it has
+        // no live speed-effect recipient meaning.
+        PlayerFilter::OpponentOfTriggeringPlayerNotAttacked => Vec::new(),
         // CR 120.1 + CR 510.1 + CR 120.9 + CR 608.2i: Each opponent who was
         // dealt combat damage this turn, optionally restricted to a matching
         // source.
@@ -183,6 +189,32 @@ fn players_for_filter(
                 .into_iter()
                 .collect()
         }
+        // CR 108.3 + CR 109.4: the owner of the first object target — owner-axis
+        // sibling of `ParentObjectTargetController`.
+        PlayerFilter::ParentObjectTargetOwner => {
+            crate::game::ability_utils::parent_target_owner(ability, state)
+                .filter(|pid| {
+                    state
+                        .players
+                        .iter()
+                        .any(|player| player.id == *pid && !player.is_eliminated)
+                })
+                .into_iter()
+                .collect()
+        }
+        // CR 608.2c + CR 109.4: the resolution-scoped chosen player at `index`.
+        PlayerFilter::ChosenPlayer { index } => ability
+            .chosen_players
+            .get(*index as usize)
+            .copied()
+            .filter(|pid| {
+                state
+                    .players
+                    .iter()
+                    .any(|player| player.id == *pid && !player.is_eliminated)
+            })
+            .into_iter()
+            .collect(),
         // CR 109.4 + CR 109.5: "each [player class] who controls [comparator]
         // [count] [filter]" — candidates satisfying both `relation` and the
         // controlled-permanent count comparison.

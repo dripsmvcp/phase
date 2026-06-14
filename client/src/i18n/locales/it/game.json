@@ -81,11 +81,73 @@
   "board": {
     "regroupCreatures": "Raggruppa i gruppi di creature duplicate",
     "changeBackground": "Cambia sfondo…",
+    "customizeLayout": "Personalizza layout…",
     "gameLog": "Registro di gioco",
     "debugLog": "Registro di debug",
     "waitingForGame": "In attesa della partita...",
     "clickOpponent": "Clicca un avversario per vedere il suo campo",
     "undo": "Annulla"
+  },
+  "battlefieldOverflow": {
+    "close": "Close",
+    "groupCount_one": "{{count}} group",
+    "groupCount_other": "{{count}} groups",
+    "noAvailablePips": "No pips",
+    "lands": {
+      "label": "Lands",
+      "open_one": "Open lands drawer ({{count}} land)",
+      "open_other": "Open lands drawer ({{count}} lands)",
+      "pipTooltip_one": "{{count}} hidden land can currently produce",
+      "pipTooltip_other": "{{count}} hidden lands can currently produce",
+      "pipAvailability": "{{untapped}} di {{total}} raddrizzate",
+      "title_one": "Lands ({{count}})",
+      "title_other": "Lands ({{count}})"
+    },
+    "creatures": {
+      "label": "Creatures",
+      "open_one": "Open creatures drawer ({{count}} creature)",
+      "open_other": "Open creatures drawer ({{count}} creatures)",
+      "title_one": "Creatures ({{count}})",
+      "title_other": "Creatures ({{count}})",
+      "totalPower": "{{power}}/{{toughness}} total power and toughness",
+      "viewAll": "Click to view all",
+      "scrollHint": "Scroll"
+    },
+    "support": {
+      "label": "Support",
+      "open_one": "Open support drawer ({{count}} permanent)",
+      "open_other": "Open support drawer ({{count}} permanents)",
+      "title_one": "Support ({{count}})",
+      "title_other": "Support ({{count}})",
+      "artifacts": "Art",
+      "enchantments": "Ench",
+      "planeswalkers": "PW",
+      "other": "Other"
+    },
+    "supportTooltips": {
+      "artifacts": "Hidden artifact permanents in this support drawer.",
+      "enchantments": "Hidden enchantment permanents in this support drawer.",
+      "planeswalkers": "Hidden planeswalkers in this support drawer.",
+      "other": "Other hidden nonland permanents in this support drawer."
+    },
+    "badges": {
+      "activate": "act",
+      "attack": "atk",
+      "attacking": "atk",
+      "incoming": "in",
+      "mana": "mana",
+      "selected": "sel",
+      "target": "target"
+    },
+    "badgeTooltips": {
+      "activate": "Hidden objects with activated abilities available.",
+      "attack": "Hidden creatures eligible to attack.",
+      "attacking": "Hidden creatures currently attacking.",
+      "incoming": "Attacks currently aimed at hidden objects in this drawer.",
+      "mana": "Hidden objects that can be tapped for mana.",
+      "selected": "Hidden objects currently selected for the active choice.",
+      "target": "Hidden objects that are legal targets."
+    }
   },
   "permanent": {
     "expandGroup": "Espandi gruppo {{name}}",
@@ -113,6 +175,7 @@
     "creaturesAbbr": "Crt",
     "landsAbbr": "Ter",
     "otherAbbr": "Alt",
+    "manaAvailable": "{{untapped}} di {{total}} terre raddrizzate",
     "out": "FUORI",
     "eliminated": "Eliminato",
     "phasedOut": "In dissolvenza",
@@ -243,6 +306,20 @@
     "experienceTooltip": "Segnalini esperienza: {{count}}",
     "speedAriaLabel": "Velocità {{value}}",
     "speedTooltip": "Velocità: {{value}}",
+    "condCantWin": "Non può vincere la partita",
+    "condCantGainLife": "Non può guadagnare punti vita",
+    "condCantLoseLife": "Non può perdere punti vita",
+    "condCantPayLife": "Non può pagare punti vita",
+    "condCantCast": "Non può lanciare magie",
+    "condCantActivate": "Non può attivare abilità",
+    "condCastOnlyFromZones": "Può lanciare solo da zone limitate",
+    "condFromSource": "{{condition}} — da {{name}}",
+    "pendingSpell": "Prossima magia",
+    "pendingCantBeCountered": "La prossima magia non può essere neutralizzata",
+    "pendingHasKeyword": "La prossima magia ha {{keyword}}",
+    "pendingFlash": "La prossima magia può essere lanciata come se avesse lampo",
+    "pendingFree": "La prossima magia senza pagare il suo costo di mana",
+    "pendingCheaper": "La prossima magia costa {{amount}} in meno",
     "companion": "Compagno"
   },
   "avatar": {
@@ -712,6 +789,15 @@
       "decline": "Non sfruttare",
       "declineDescription": "{{name}} attacca normalmente e si STAPpa come al solito."
     },
+    "enlist": {
+      "attackerFallback": "Attacker",
+      "creatureFallback": "Creature",
+      "title": "Enlist for {{name}}?",
+      "subtitle": "Choose a creature to tap for this Enlist instance.",
+      "tapDescription": "Tap {{name}} so {{attacker}} gets power from it.",
+      "decline": "Don't enlist",
+      "declineDescription": "{{attacker}} attacks without enlisting a creature."
+    },
     "cost": {
       "discardCard": "scarta una carta",
       "life": "{{amount}} punti vita",
@@ -852,6 +938,12 @@
     "ringBearer": {
       "title": "Scegli il Portatore dell'Anello",
       "subtitle": "Scegli una creatura che controlli"
+    },
+    "learn": {
+      "title": "Learn",
+      "subtitle": "Discard a card to draw a card, or skip",
+      "labelRummage": "Discard & draw",
+      "labelSkip": "Skip"
     },
     "reorderHint": "Trascina per riordinare · la prima carta è pescata per prima",
     "scry": {
@@ -1201,6 +1293,22 @@
     "evokeNormalLabel": "Lancia normalmente",
     "evokeAltLabel": "Lancia con Evocare",
     "evokeSubtitle": "Lancia {{name}} normalmente o lanciala per il suo costo di Evocare.",
+    "emergeEyebrow": "Emergere",
+    "emergeNormalLabel": "Lancia normalmente",
+    "emergeAltLabel": "Lancia con Emergere",
+    "emergeSubtitle": "Lancia {{name}} normalmente o paga il suo costo di Emergere, ridotto dal valore di mana di una creatura che sacrifichi.",
+    "impendingEyebrow": "Incombente",
+    "impendingNormalLabel": "Lancia come creatura",
+    "impendingAltLabel": "Lancia con Incombente",
+    "impendingSubtitle": "Lancia {{name}} normalmente come creatura o paga il suo costo di Incombente: entra con segnalini tempo e non è una creatura finché non viene rimosso l'ultimo.",
+    "prototypeEyebrow": "Prototipo",
+    "prototypeNormalLabel": "Lancia normalmente",
+    "prototypeAltLabel": "Lancia con Prototipo",
+    "prototypeSubtitle": "Lancia {{name}} normalmente o paga il suo costo di Prototipo per lanciarla con il suo colore, valore di mana, forza e costituzione da prototipo.",
+    "spectacleEyebrow": "Spettacolo",
+    "spectacleNormalLabel": "Lancia normalmente",
+    "spectacleAltLabel": "Lancia con Spettacolo",
+    "spectacleSubtitle": "Lancia {{name}} normalmente o paga il suo costo di Spettacolo (disponibile perché un avversario ha perso punti vita in questo turno).",
     "overloadEyebrow": "Sovraccarico",
     "overloadNormalLabel": "Lancia normalmente",
     "overloadAltLabel": "Lancia con Sovraccarico",
@@ -1221,6 +1329,22 @@
     "mtmteNormalLabel": "Cast Normally",
     "mtmteAltLabel": "Cast Converted",
     "mtmteSubtitle": "Cast {{name}} normally, or pay its More Than Meets the Eye cost to cast it converted (transformed, back face up).",
+    "emergeEyebrow": "Emergere",
+    "emergeNormalLabel": "Lancia normalmente",
+    "emergeAltLabel": "Lancia con Emergere",
+    "emergeSubtitle": "Lancia {{name}} normalmente, o paga il suo costo di Emergere sacrificando una creatura, riducendo il costo del valore di mana di quella creatura.",
+    "impendingEyebrow": "Incombere",
+    "impendingNormalLabel": "Lancia normalmente",
+    "impendingAltLabel": "Lancia con Incombere",
+    "impendingSubtitle": "Lancia {{name}} normalmente, o paga il suo costo di Incombere: entra con segnalini tempo e non è una creatura finché non viene rimosso l'ultimo.",
+    "prototypeEyebrow": "Prototipo",
+    "prototypeNormalLabel": "Lancia normalmente",
+    "prototypeAltLabel": "Lancia con Prototipo",
+    "prototypeSubtitle": "Lancia {{name}} normalmente, o paga il suo costo di Prototipo per lanciarla con la sua forza, costituzione e colore inferiori.",
+    "spectacleEyebrow": "Spettacolo",
+    "spectacleNormalLabel": "Lancia normalmente",
+    "spectacleAltLabel": "Lancia con Spettacolo",
+    "spectacleSubtitle": "Lancia {{name}} normalmente, o paga il suo costo di Spettacolo (disponibile perché un avversario ha perso punti vita in questo turno).",
     "additionalExile": "+ Esilia una carta",
     "additionalSacrifice": "+ Sacrifica un permanente",
     "additionalPayLife": "+ Paga punti vita",
@@ -1236,6 +1360,18 @@
   "clashOpponent": {
     "title": "Scegli l'avversario per lo scontro",
     "subtitle": "Scegli quale avversario si scontrerà con te."
+  },
+  "assist": {
+    "choose": {
+      "title": "Choose a Player to Assist",
+      "subtitle": "Choose another player who may pay up to {{max}} generic mana for this spell.",
+      "decline": "Decline"
+    },
+    "payment": {
+      "title": "Assist: Pay Generic Mana",
+      "commit": "Pay {{value}}",
+      "decline": "Pay nothing"
+    }
   },
   "cardDataMissing": {
     "title": "Dati delle carte mancanti",
@@ -1306,6 +1442,7 @@
     "eyebrow": "Scelta",
     "title": "Scegline uno",
     "subtitle": "Seleziona l'opzione da risolvere.",
+    "subtitleBinary": "Scegli una delle due opzioni qui sotto.",
     "optionFallback": "Opzione {{number}}"
   },
   "combatTax": {
@@ -1483,7 +1620,9 @@
     "scopeMulti": "Scegli nuovi bersagli per la magia",
     "subtitle": "{{scope}}. Attuale: {{current}}",
     "confirm": "Conferma",
-    "badgeNewTarget": "Nuovo bersaglio"
+    "badgeNewTarget": "Nuovo bersaglio",
+    "slotLabel": "Bersaglio {{index}}: {{current}} → {{chosen}}",
+    "unselected": "invariato"
   },
   "separatePiles": {
     "chooserName": "Giocatore {{number}}",

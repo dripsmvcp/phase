@@ -958,6 +958,12 @@ fn collect_matching_players(
                     PlayerFilter::OpponentGainedLife => {
                         p.id != source_controller && p.life_gained_this_turn > 0
                     }
+                    // CR 104.5 / CR 800.4: Players who lost have left the game;
+                    // this filter is quantity-only and has no live damage recipient.
+                    PlayerFilter::HasLostTheGame => false,
+                    // CR 506.2 + CR 508.6: Count-only filter (Suppressor Skyguard);
+                    // it has no live damage-recipient meaning.
+                    PlayerFilter::OpponentOfTriggeringPlayerNotAttacked => false,
                     // CR 120.1 + CR 510.1 + CR 120.9 + CR 608.2i: Each opponent
                     // who was dealt combat damage this turn, optionally
                     // restricted to a matching source.
@@ -1030,10 +1036,13 @@ fn collect_matching_players(
                         .last_vote_ballots
                         .iter()
                         .any(|(voter, idx)| *voter == p.id && *idx == choice_index),
-                    // CR 109.4: the parent-object-target anchor has no meaning
-                    // for a damage-each-player effect (no parent object target
-                    // is in scope); never matches.
-                    PlayerFilter::ParentObjectTargetController => false,
+                    // CR 109.4 + CR 108.3: the parent-object-target anchors and
+                    // the resolution-scoped chosen-player anchor have no meaning
+                    // for a damage-each-player effect (no parent object target /
+                    // chosen player is in scope here); never matches.
+                    PlayerFilter::ParentObjectTargetController
+                    | PlayerFilter::ParentObjectTargetOwner
+                    | PlayerFilter::ChosenPlayer { .. } => false,
                     // CR 109.4 + CR 109.5: "each [player class] who controls
                     // [comparator] [count] [filter]" — candidate satisfies both
                     // `relation` and the controlled-permanent count comparison.
@@ -1144,6 +1153,12 @@ pub fn resolve_each_player(
                     PlayerFilter::OpponentGainedLife => {
                         p.id != ability.controller && p.life_gained_this_turn > 0
                     }
+                    // CR 104.5 / CR 800.4: Players who lost have left the game;
+                    // this filter is quantity-only and has no live damage recipient.
+                    PlayerFilter::HasLostTheGame => false,
+                    // CR 506.2 + CR 508.6: Count-only filter (Suppressor Skyguard);
+                    // it has no live damage-recipient meaning.
+                    PlayerFilter::OpponentOfTriggeringPlayerNotAttacked => false,
                     // CR 120.1 + CR 510.1 + CR 120.9 + CR 608.2i: Each opponent
                     // who was dealt combat damage this turn, optionally
                     // restricted to a matching source.
@@ -1218,10 +1233,13 @@ pub fn resolve_each_player(
                         .last_vote_ballots
                         .iter()
                         .any(|(voter, idx)| *voter == p.id && *idx == *choice_index),
-                    // CR 109.4: the parent-object-target anchor has no meaning
-                    // for a damage-each-player effect (no parent object target
-                    // is in scope); never matches.
-                    PlayerFilter::ParentObjectTargetController => false,
+                    // CR 109.4 + CR 108.3: the parent-object-target anchors and
+                    // the resolution-scoped chosen-player anchor have no meaning
+                    // for a damage-each-player effect (no parent object target /
+                    // chosen player is in scope here); never matches.
+                    PlayerFilter::ParentObjectTargetController
+                    | PlayerFilter::ParentObjectTargetOwner
+                    | PlayerFilter::ChosenPlayer { .. } => false,
                     // CR 109.4 + CR 109.5: "each [player class] who controls
                     // [comparator] [count] [filter]" — candidate satisfies both
                     // `relation` and the controlled-permanent count comparison.

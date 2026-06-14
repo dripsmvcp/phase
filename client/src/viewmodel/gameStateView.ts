@@ -1,4 +1,5 @@
 import type {
+  GameAction,
   GameObject,
   GameState,
   ObjectId,
@@ -10,6 +11,7 @@ import {
   partitionByType,
   type GroupedPermanent,
 } from "./battlefieldProps";
+import { playOrCastActionsForObject } from "./cardActionChoice.ts";
 
 export interface PlayerBattlefieldView {
   creatures: GroupedPermanent[];
@@ -128,11 +130,55 @@ export function getWaitingForObjectChoiceIds(
       return waitingFor.data.legal_targets.flatMap((target) =>
         "Object" in target ? [target.Object] : [],
       );
-    case "PairChoice":
-      return waitingFor.data.choices;
     default:
       return [];
   }
+}
+
+export type ZoneViewerTarget = {
+  zone: "graveyard" | "exile";
+  playerId: PlayerId;
+  objectIds: ObjectId[];
+};
+
+/**
+ * When the player has Priority and the engine surfaces play/cast actions on
+ * graveyard or exile cards (Retrace, Flashback, Adventure, etc.), return the
+ * sole zone pile to auto-open in `ZoneViewer`. Mirrors the object-choice
+ * auto-open grouping: only auto-open when every castable card lives in one
+ * zone+owner pile so we don't trap the player in the wrong graveyard.
+ */
+export function getCastableZoneViewerTarget(
+  waitingFor: WaitingFor | null | undefined,
+  objects: Record<ObjectId, GameObject> | undefined,
+  legalActionsByObject: Record<string, GameAction[]> | undefined,
+): ZoneViewerTarget | null {
+  if (waitingFor?.type !== "Priority" || !objects || !legalActionsByObject) {
+    return null;
+  }
+
+  const groups = new Set<string>();
+  let firstHit: ZoneViewerTarget | null = null;
+  const objectIds: ObjectId[] = [];
+
+  for (const key of Object.keys(legalActionsByObject)) {
+    const objectId = Number(key) as ObjectId;
+    if (playOrCastActionsForObject(legalActionsByObject, objectId).length === 0) {
+      continue;
+    }
+    const obj = objects[objectId];
+    if (!obj) continue;
+    if (obj.zone !== "Graveyard" && obj.zone !== "Exile") continue;
+
+    const zone: ZoneViewerTarget["zone"] =
+      obj.zone === "Graveyard" ? "graveyard" : "exile";
+    groups.add(`${zone}:${obj.owner}`);
+    objectIds.push(objectId);
+    if (!firstHit) firstHit = { zone, playerId: obj.owner, objectIds };
+  }
+
+  objectIds.sort((a, b) => a - b);
+  return groups.size === 1 ? firstHit : null;
 }
 
 export function buildPlayerBattlefieldView(

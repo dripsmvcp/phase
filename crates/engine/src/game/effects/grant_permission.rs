@@ -7,6 +7,19 @@ use crate::types::game_state::GameState;
 use crate::types::identifiers::TrackedSetId;
 use crate::types::player::PlayerId;
 
+#[cfg(test)]
+use crate::game::casting::{can_pay_cost_after_auto_tap, spell_objects_available_to_cast};
+#[cfg(test)]
+use crate::types::ability::{AbilityDefinition, AbilityKind, ManaSpendPermission, QuantityExpr};
+#[cfg(test)]
+use crate::types::card_type::CoreType;
+#[cfg(test)]
+use crate::types::identifiers::ObjectId;
+#[cfg(test)]
+use crate::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+#[cfg(test)]
+use std::sync::Arc;
+
 /// Grant a CastingPermission to the target object (CR 604.6).
 ///
 /// Implements static abilities that modify where/how a card can be cast, such as
@@ -32,8 +45,8 @@ pub fn resolve(
     // `ability.targets`. Short-circuit BEFORE the chosen-targets fallback so
     // chained grants don't inherit parent targets via
     // `effects::mod.rs::resolve_ability_chain`.
-    let target_ids: Vec<_> = match target_filter {
-        TargetFilter::SelfRef => vec![ability.source_id],
+    let (target_ids, tracked_set_group): (Vec<_>, Option<TrackedSetId>) = match target_filter {
+        TargetFilter::SelfRef => (vec![ability.source_id], None),
         // CR 608.2c: The `TrackedSetId(0)` sentinel binds to the highest tracked
         // set id — the set the immediately preceding effect in this chain
         // published. Empty sets are *not* skipped: an empty current set means
@@ -48,40 +61,52 @@ pub fn resolve(
             .tracked_object_sets
             .iter()
             .max_by_key(|(id, _)| id.0)
-            .map(|(_, objects)| objects.clone())
+            .map(|(id, objects)| (objects.clone(), Some(*id)))
             .unwrap_or_default(),
-        TargetFilter::TrackedSet { id } => state
-            .tracked_object_sets
-            .get(id)
-            .cloned()
-            .unwrap_or_default(),
-        TargetFilter::ParentTarget => ability
-            .targets
-            .iter()
-            .filter_map(|target| match target {
-                TargetRef::Object(obj_id) => Some(*obj_id),
-                TargetRef::Player(_) => None,
-            })
-            .collect(),
-        TargetFilter::Any | TargetFilter::None if !ability.targets.is_empty() => ability
-            .targets
-            .iter()
-            .filter_map(|target| match target {
-                TargetRef::Object(obj_id) => Some(*obj_id),
-                TargetRef::Player(_) => None,
-            })
-            .collect(),
-        TargetFilter::Any | TargetFilter::None => vec![ability.source_id],
+        TargetFilter::TrackedSet { id } => (
+            state
+                .tracked_object_sets
+                .get(id)
+                .cloned()
+                .unwrap_or_default(),
+            Some(*id),
+        ),
+        TargetFilter::ParentTarget => (
+            ability
+                .targets
+                .iter()
+                .filter_map(|target| match target {
+                    TargetRef::Object(obj_id) => Some(*obj_id),
+                    TargetRef::Player(_) => None,
+                })
+                .collect(),
+            None,
+        ),
+        TargetFilter::Any | TargetFilter::None if !ability.targets.is_empty() => (
+            ability
+                .targets
+                .iter()
+                .filter_map(|target| match target {
+                    TargetRef::Object(obj_id) => Some(*obj_id),
+                    TargetRef::Player(_) => None,
+                })
+                .collect(),
+            None,
+        ),
+        TargetFilter::Any | TargetFilter::None => (vec![ability.source_id], None),
         other => {
             let ctx = crate::game::filter::FilterContext::from_ability(ability);
-            state
-                .objects
-                .keys()
-                .copied()
-                .filter(|obj_id| {
-                    crate::game::filter::matches_target_filter(state, *obj_id, other, &ctx)
-                })
-                .collect()
+            (
+                state
+                    .objects
+                    .keys()
+                    .copied()
+                    .filter(|obj_id| {
+                        crate::game::filter::matches_target_filter(state, *obj_id, other, &ctx)
+                    })
+                    .collect(),
+                None,
+            )
         }
     };
 
@@ -118,12 +143,17 @@ pub fn resolve(
                 granted_to,
                 source_id,
                 exiled_by_ability_controller,
+                single_use,
+                single_use_group,
                 ..
             } = &mut granted
             {
                 *granted_to = granted_to_pid;
                 *source_id = Some(ability.source_id);
                 *exiled_by_ability_controller = Some(ability.controller);
+                if *single_use {
+                    *single_use_group = tracked_set_group;
+                }
             }
             // CR 611.2a + CR 118.9: Bind `granted_to` for `ExileWithAltCost` and
             // `ExileWithAltAbilityCost` to the resolved grantee. Without this
@@ -218,6 +248,9 @@ mod tests {
                     source_id: None,
                     exiled_by_ability_controller: None,
                     mana_spend_permission: None,
+                    card_filter: None,
+                    single_use_group: None,
+                    single_use: false,
                 },
                 target: TargetFilter::Any,
                 grantee: PermissionGrantee::AbilityController,
@@ -236,6 +269,60 @@ mod tests {
                 assert_eq!(granted_to, PlayerId(0), "granted_to should be the caster");
             }
             _ => panic!("expected PlayFromExile"),
+        }
+    }
+
+    /// CR 603.7 + CR 611.2a: A tracked-set `single_use` `PlayFromExile` grant
+    /// carries the tracked-set identity as its consumption group. The source id
+    /// remains the ability source for provenance/once-per-turn logic.
+    #[test]
+    fn single_use_play_from_exile_grant_stamps_tracked_set_group() {
+        let mut state = GameState::new_two_player(1);
+        let source = crate::types::identifiers::ObjectId(100);
+        let target = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Exiled Card".to_string(),
+            Zone::Exile,
+        );
+        let tracked_set = TrackedSetId(7);
+        state.tracked_object_sets.insert(tracked_set, vec![target]);
+        let ability = ResolvedAbility::new(
+            Effect::GrantCastingPermission {
+                permission: CastingPermission::PlayFromExile {
+                    duration: Duration::UntilEndOfNextTurnOf {
+                        player: PlayerScope::Controller,
+                    },
+                    granted_to: PlayerId(0),
+                    frequency: crate::types::statics::CastFrequency::Unlimited,
+                    source_id: None,
+                    exiled_by_ability_controller: None,
+                    mana_spend_permission: None,
+                    card_filter: None,
+                    single_use_group: None,
+                    single_use: true,
+                },
+                target: TargetFilter::TrackedSet { id: tracked_set },
+                grantee: PermissionGrantee::AbilityController,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        match &state.objects[&target].casting_permissions[0] {
+            CastingPermission::PlayFromExile {
+                source_id,
+                single_use_group,
+                ..
+            } => {
+                assert_eq!(*source_id, Some(source));
+                assert_eq!(*single_use_group, Some(tracked_set));
+            }
+            other => panic!("expected PlayFromExile, got {other:?}"),
         }
     }
 
@@ -347,6 +434,9 @@ mod tests {
                     source_id: None,
                     exiled_by_ability_controller: None,
                     mana_spend_permission: None,
+                    card_filter: None,
+                    single_use_group: None,
+                    single_use: false,
                 },
                 target: TargetFilter::Any,
                 grantee: PermissionGrantee::ObjectOwner,
@@ -398,6 +488,9 @@ mod tests {
                     source_id: None,
                     exiled_by_ability_controller: None,
                     mana_spend_permission: None,
+                    card_filter: None,
+                    single_use_group: None,
+                    single_use: false,
                 },
                 target: TargetFilter::Any,
                 grantee: PermissionGrantee::ParentTargetController,
@@ -462,6 +555,9 @@ mod tests {
                     source_id: None,
                     exiled_by_ability_controller: None,
                     mana_spend_permission: None,
+                    card_filter: None,
+                    single_use_group: None,
+                    single_use: false,
                 },
                 target: TargetFilter::Any,
                 grantee: PermissionGrantee::ObjectOwner,
@@ -538,6 +634,9 @@ mod tests {
             source_id: None,
             exiled_by_ability_controller: None,
             mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
         };
 
         state.objects.get_mut(&card_a).unwrap().casting_permissions = vec![mk_perm(
@@ -610,6 +709,9 @@ mod tests {
             source_id: None,
             exiled_by_ability_controller: Some(PlayerId(0)),
             mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
         };
         state
             .objects
@@ -668,6 +770,9 @@ mod tests {
             source_id: None,
             exiled_by_ability_controller: None,
             mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
         }];
 
         // Simulate the ordering in `turns.rs`:
@@ -699,6 +804,9 @@ mod tests {
                     source_id: None,
                     exiled_by_ability_controller: None,
                     mana_spend_permission: None,
+                    card_filter: None,
+                    single_use_group: None,
+                    single_use: false,
                 },
                 target: TargetFilter::Any,
                 grantee: PermissionGrantee::ObjectOwner,
@@ -763,6 +871,9 @@ mod tests {
                 source_id: None,
                 exiled_by_ability_controller: None,
                 mana_spend_permission: None,
+                card_filter: None,
+                single_use_group: None,
+                single_use: false,
             }];
 
         prune_end_of_turn_casting_permissions(&mut state);
@@ -800,6 +911,9 @@ mod tests {
                 source_id: None,
                 exiled_by_ability_controller: None,
                 mana_spend_permission: None,
+                card_filter: None,
+                single_use_group: None,
+                single_use: false,
             }];
 
         prune_until_next_turn_casting_permissions(&mut state, PlayerId(0));
@@ -808,6 +922,85 @@ mod tests {
             state.objects[&card].casting_permissions.len(),
             1,
             "UntilNextStepOf {{ step: End }} must survive the untap-step prune",
+        );
+    }
+
+    /// Issue #1200 — Gonti, Night Minister: the third-person tracked-set grant
+    /// with `AnyTypeOrColor` must let the parent player target pay off-color mana
+    /// to cast the exiled spell.
+    #[test]
+    fn parent_target_controller_any_mana_allows_off_color_cast_payment() {
+        let mut state = GameState::new_two_player(1);
+        let exiled = create_object(
+            &mut state,
+            CardId(1200),
+            PlayerId(1),
+            "Borrowed Blue Spell".to_string(),
+            Zone::Exile,
+        );
+        state
+            .tracked_object_sets
+            .insert(TrackedSetId(1200), vec![exiled]);
+        {
+            let obj = state.objects.get_mut(&exiled).unwrap();
+            obj.card_types.core_types.push(CoreType::Sorcery);
+            Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            ));
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 0,
+            };
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::GrantCastingPermission {
+                permission: CastingPermission::PlayFromExile {
+                    duration: Duration::Permanent,
+                    granted_to: PlayerId(0),
+                    frequency: crate::types::statics::CastFrequency::Unlimited,
+                    source_id: None,
+                    exiled_by_ability_controller: None,
+                    mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
+                    card_filter: None,
+                    single_use_group: None,
+                    single_use: false,
+                },
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0),
+                },
+                grantee: PermissionGrantee::ParentTargetController,
+            },
+            vec![TargetRef::Player(PlayerId(1))],
+            crate::types::identifiers::ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        state.players[1].mana_pool.add(ManaUnit::new(
+            ManaType::Red,
+            ObjectId(0),
+            false,
+            Vec::new(),
+        ));
+
+        assert!(
+            spell_objects_available_to_cast(&state, PlayerId(1)).contains(&exiled),
+            "parent target should see the exiled spell as castable"
+        );
+        assert!(
+            can_pay_cost_after_auto_tap(
+                &state,
+                PlayerId(1),
+                exiled,
+                &state.objects[&exiled].mana_cost
+            ),
+            "AnyTypeOrColor should let red mana pay for a blue spell"
         );
     }
 }

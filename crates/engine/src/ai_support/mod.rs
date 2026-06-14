@@ -114,21 +114,7 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
         // validity check the engine handler enforces. Reject early so the
         // simulation filter never fires a known-rejected action.
         (WaitingFor::OrderTriggers { triggers, .. }, GameAction::OrderTriggers { order }) => {
-            let len = triggers.len();
-            if order.len() != len {
-                true
-            } else {
-                let mut seen = vec![false; len];
-                let mut bad = false;
-                for &i in order {
-                    if i >= len || seen[i] {
-                        bad = true;
-                        break;
-                    }
-                    seen[i] = true;
-                }
-                bad
-            }
+            !crate::game::triggers::is_valid_permutation(order, triggers.len())
         }
         (
             WaitingFor::CopyTargetChoice { valid_targets, .. },
@@ -351,12 +337,19 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
                 cards,
                 count,
                 up_to,
+                constraint,
                 ..
             },
             GameAction::SelectCards { cards: chosen },
         ) => {
-            let exact = if *up_to { None } else { Some(*count) };
-            selection_mismatch(chosen, cards, exact) || (*up_to && chosen.len() > *count)
+            // CR 701.23b vs CR 701.23d: a stated-quality search (MatchEachFilter,
+            // etc.) may legally find fewer cards than requested — including none.
+            // Mirror the submission guard / candidate generation lower bound so
+            // the validated legal-action path does not drop the legal short/empty
+            // fail-to-find candidate and freeze the AI.
+            let lower_bounded = *up_to || constraint.permits_partial_find();
+            let exact = if lower_bounded { None } else { Some(*count) };
+            selection_mismatch(chosen, cards, exact) || (lower_bounded && chosen.len() > *count)
         }
         (
             WaitingFor::ChooseFromZoneChoice {
@@ -641,6 +634,16 @@ fn auto_passes_initial_priority_by_default(state: &GameState) -> bool {
     state.stack.is_empty() && matches!(state.phase, Phase::Upkeep | Phase::Draw)
 }
 
+/// CR 117.1d + CR 601.2g: True when the player has a spell the castability gate
+/// accepts via manual mana-ability payment even though the simulation oracle
+/// (`SimulationFilter`) rejects the Auto-mode `CastSpell` candidate (issue #562,
+/// #583). Frontends surface these via `spell_costs` + manual cast dispatch.
+fn has_feasibly_castable_spell(state: &GameState, player: PlayerId) -> bool {
+    crate::game::casting::spell_objects_available_to_cast(state, player)
+        .iter()
+        .any(|&object_id| crate::game::casting::can_cast_object_now(state, player, object_id))
+}
+
 /// Determines whether the frontend should auto-pass the current priority window.
 ///
 /// Returns `true` when auto-passing is recommended:
@@ -659,6 +662,10 @@ pub fn auto_pass_recommended(state: &GameState, actions: &[GameAction]) -> bool 
 
     if auto_passes_initial_priority_by_default(state) {
         return true;
+    }
+
+    if has_feasibly_castable_spell(state, player) {
+        return false;
     }
 
     if !has_meaningful_priority_action(state, actions) {
@@ -991,7 +998,8 @@ mod tests {
     use crate::types::ability::{
         AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ContinuousModification,
         ControllerRef, Effect, FilterProp, ManaContribution, ManaProduction, QuantityExpr,
-        ResolvedAbility, SearchSelectionConstraint, StaticDefinition, TargetFilter, TypedFilter,
+        ResolvedAbility, SacrificeCost, SearchSelectionConstraint, StaticDefinition, TargetFilter,
+        TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
@@ -1796,12 +1804,10 @@ mod tests {
                         target: None,
                     },
                 )
-                .cost(AbilityCost::Sacrifice {
-                    target: TargetFilter::Typed(
-                        TypedFilter::creature().controller(ControllerRef::You),
-                    ),
-                    count: 1,
-                }),
+                .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+                    TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+                    1,
+                ))),
             );
         }
 
@@ -2009,6 +2015,53 @@ mod tests {
     }
 
     #[test]
+    fn cheap_reject_candidate_permits_partial_constrained_search() {
+        // CR 701.23b: a stated-quality (MatchEachFilter) search may legally find
+        // fewer cards than requested — including none. The validated legal-action
+        // path must NOT cheap-reject a short/empty pick, or the AI freezes.
+        let mut state = GameState::new_two_player(42);
+        let choices = vec![ObjectId(1), ObjectId(2)];
+        state.waiting_for = WaitingFor::SearchChoice {
+            player: PlayerId(0),
+            cards: choices.clone(),
+            count: 2,
+            reveal: false,
+            up_to: false,
+            constraint: SearchSelectionConstraint::MatchEachFilter {
+                filters: vec![TargetFilter::Any, TargetFilter::Any],
+            },
+            split: None,
+        };
+
+        // Empty (full fail-to-find) is legal and must survive cheap-reject.
+        assert!(!cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards { cards: vec![] }
+        ));
+        // Partial pick (one of two) is legal and must survive cheap-reject.
+        assert!(!cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards {
+                cards: vec![choices[0]]
+            }
+        ));
+        // The full pick is still legal.
+        assert!(!cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards {
+                cards: choices.clone()
+            }
+        ));
+        // Over the requested count remains rejected.
+        assert!(cheap_reject_candidate(
+            &state,
+            &GameAction::SelectCards {
+                cards: vec![choices[0], choices[1], ObjectId(3)]
+            }
+        ));
+    }
+
+    #[test]
     fn auto_pass_does_not_skip_non_mana_land_ability() {
         // Shifting Woodland pattern: a land with both a mana ability and a
         // non-mana activated ability (delirium BecomeCopy). Auto-pass must NOT
@@ -2176,10 +2229,10 @@ mod tests {
                         target: None,
                     },
                 )
-                .cost(AbilityCost::Sacrifice {
-                    target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
-                    count: 1,
-                }),
+                .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
+                    1,
+                ))),
             );
         }
 
@@ -2208,6 +2261,8 @@ mod tests {
                 object_id: ObjectId(10),
                 card_id: CardId(10),
                 targets: Vec::new(),
+
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
 

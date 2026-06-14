@@ -635,6 +635,11 @@ export interface SerializedAbility {
    *  confirmation modal for a lone card-consuming action — see
    *  requiresConfirmation in viewmodel/cardActionChoice.ts. */
   consumes_source?: boolean;
+  /** Derived by the engine (CR 605.1a, mana_abilities::is_mana_ability): true
+   *  when this is a mana ability. Absent / false otherwise. The UI uses this to
+   *  route mana-tap affordances instead of introspecting the effect AST — see
+   *  isManaObjectAction in viewmodel/cardActionChoice.ts. */
+  is_mana_ability?: boolean;
   [key: string]: unknown;
 }
 
@@ -722,6 +727,9 @@ export interface GameObject {
   class_level?: number;
   devotion?: number;
   available_mana_pips?: ManaPip[];
+  /** CR 701.15c: players who have goaded this creature (it must attack a
+   *  player other than them, if able). Empty/omitted when not goaded. */
+  goaded_by?: PlayerId[];
   casting_permissions?: CastingPermission[];
   is_emblem?: boolean;
   /**
@@ -1135,7 +1143,10 @@ export type WaitingFor =
   | { type: "DefilerPayment"; data: { player: PlayerId; life_cost: number; mana_reduction: ManaCost; pending_cast: PendingCast } }
   | { type: "CastOffer"; data: { player: PlayerId; kind: CastOfferKind } }
   | { type: "ModalFaceChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId } }
-  | { type: "AlternativeCastChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode; keyword: { type: "Warp" } | { type: "Evoke" } | { type: "Dash" } | { type: "Overload" } | { type: "Bestow" } | { type: "Awaken" } | { type: "Cleave" } | { type: "MoreThanMeetsTheEye" } | { type: "Mutate" } | { type: "Blitz" }; normal_cost: ManaCost; alternative_cost: ManaCost | null; alternative_additional_cost: SerializedAbilityCost | null } }
+  // `keyword.type` mirrors engine `AlternativeCastKeyword` (game_state.rs) 1:1.
+  // Keep this union exhaustive with the engine enum so the modal's keyword
+  // switch is type-checked against every variant the engine can emit.
+  | { type: "AlternativeCastChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode; keyword: { type: "Warp" } | { type: "Evoke" } | { type: "Emerge" } | { type: "Dash" } | { type: "Blitz" } | { type: "Overload" } | { type: "Bestow" } | { type: "Awaken" } | { type: "Cleave" } | { type: "MoreThanMeetsTheEye" } | { type: "Impending" } | { type: "Prototype" } | { type: "Mutate" } | { type: "Spectacle" }; normal_cost: ManaCost; alternative_cost: ManaCost | null; alternative_additional_cost: SerializedAbilityCost | null } }
   // CR 702.140c + CR 730.2a: mutating creature spell resolving with a legal
   // target — controller chooses to put it on top of or under the target creature.
   | { type: "MutateMergeChoice"; data: { player: PlayerId; merging_id: ObjectId; target_id: ObjectId } }
@@ -1202,6 +1213,7 @@ export type WaitingFor =
   | { type: "CombatTaxPayment"; data: { player: PlayerId; context: CombatTaxContext; total_cost: ManaCost; per_creature: [ObjectId, ManaCost][]; pending: CombatTaxPending } }
   | { type: "UntapChoice"; data: { player: PlayerId; candidates: ObjectId[]; chosen_not_to_untap?: ObjectId[] } }
   | { type: "ExertChoice"; data: { player: PlayerId; attacker: ObjectId; remaining?: ObjectId[] } }
+  | { type: "EnlistChoice"; data: { player: PlayerId; attacker: ObjectId; eligible: ObjectId[]; remaining?: ObjectId[] } }
   | { type: "PhyrexianPayment"; data: { player: PlayerId; spell_object: ObjectId; shards: PhyrexianShard[] } }
   | { type: "AssignCombatDamage"; data: { player: PlayerId; attacker_id: ObjectId; total_damage: number; blockers: { blocker_id: ObjectId; lethal_minimum: number }[]; trample: TrampleKind | null; defending_player: PlayerId; attack_target: AttackTarget; pw_loyalty?: number; pw_controller?: PlayerId } }
   // CR 510.1d + CR 702.22k: a blocking creature blocking a banded attacker —
@@ -1477,8 +1489,7 @@ export type GameAction =
   | { type: "PassPriority" }
   | { type: "ChooseActivationCostBranch"; data: { index: number } }
   | { type: "PlayLand"; data: { object_id: ObjectId; card_id: CardId } }
-  | { type: "CastSpell"; data: { object_id: ObjectId; card_id: CardId; targets: ObjectId[] } }
-  | { type: "CastSpellWithPaymentMode"; data: { object_id: ObjectId; card_id: CardId; targets: ObjectId[]; payment_mode: CastPaymentMode } }
+  | { type: "CastSpell"; data: { object_id: ObjectId; card_id: CardId; targets: ObjectId[]; payment_mode?: CastPaymentMode } }
   | { type: "Foretell"; data: { object_id: ObjectId; card_id: CardId } }
   | { type: "ActivateAbility"; data: { source_id: ObjectId; ability_index: number } }
   | { type: "DeclareAttackers"; data: { attacks: [ObjectId, AttackTarget][]; bands?: ObjectId[][] } }
@@ -1521,20 +1532,15 @@ export type GameAction =
   | { type: "ChooseCastingVariant"; data: { index: number } }
   | { type: "KeepAllCopyTargets" }
   | { type: "ChoosePermanentTypeSlot"; data: { slot: CoreType } }
-  | { type: "CastSpellForFree"; data: { object_id: ObjectId; card_id: CardId; source_id: ObjectId } }
-  | { type: "CastSpellForFreeWithPaymentMode"; data: { object_id: ObjectId; card_id: CardId; source_id: ObjectId; payment_mode: CastPaymentMode } }
-  | { type: "CastSpellAsMiracle"; data: { object_id: ObjectId; card_id: CardId } }
-  | { type: "CastSpellAsMiracleWithPaymentMode"; data: { object_id: ObjectId; card_id: CardId; payment_mode: CastPaymentMode } }
-  | { type: "CastSpellAsMadness"; data: { object_id: ObjectId; card_id: CardId } }
-  | { type: "CastSpellAsMadnessWithPaymentMode"; data: { object_id: ObjectId; card_id: CardId; payment_mode: CastPaymentMode } }
+  | { type: "CastSpellForFree"; data: { object_id: ObjectId; card_id: CardId; source_id: ObjectId; payment_mode?: CastPaymentMode } }
+  | { type: "CastSpellAsMiracle"; data: { object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode } }
+  | { type: "CastSpellAsMadness"; data: { object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode } }
   // CR 702.190a: Cast a spell from hand via the Sneak alternative cost during
   // the declare-blockers step, returning an unblocked attacker you control.
   // Applies to any card type; CR 702.190b enter-attacking-alongside is
   // handled engine-side for permanent spells only.
-  | { type: "CastSpellAsSneak"; data: { hand_object: ObjectId; card_id: CardId; creature_to_return: ObjectId } }
-  | { type: "CastSpellAsSneakWithPaymentMode"; data: { hand_object: ObjectId; card_id: CardId; creature_to_return: ObjectId; payment_mode: CastPaymentMode } }
-  | { type: "CastSpellAsWebSlinging"; data: { hand_object: ObjectId; card_id: CardId; creature_to_return: ObjectId } }
-  | { type: "CastSpellAsWebSlingingWithPaymentMode"; data: { hand_object: ObjectId; card_id: CardId; creature_to_return: ObjectId; payment_mode: CastPaymentMode } }
+  | { type: "CastSpellAsSneak"; data: { hand_object: ObjectId; card_id: CardId; creature_to_return: ObjectId; payment_mode?: CastPaymentMode } }
+  | { type: "CastSpellAsWebSlinging"; data: { hand_object: ObjectId; card_id: CardId; creature_to_return: ObjectId; payment_mode?: CastPaymentMode } }
   | { type: "ActivateNinjutsu"; data: { ninjutsu_object_id: ObjectId; creature_to_return: ObjectId } }
   | { type: "DecideOptionalEffect"; data: { accept: boolean } }
   | { type: "DecideOptionalEffectAndRemember"; data: { choice: AutoMayChoice } }
@@ -1549,6 +1555,7 @@ export type GameAction =
   | { type: "PayCombatTax"; data: { accept: boolean } }
   | { type: "ChooseUntap"; data: { object_id: ObjectId; untap: boolean } }
   | { type: "ChooseExert"; data: { exert: boolean } }
+  | { type: "ChooseEnlist"; data: { target: ObjectId | null } }
   | { type: "HarmonizeTap"; data: { creature_id: ObjectId | null } }
   | { type: "DeclareCompanion"; data: { card_index: number | null } }
   | { type: "CompanionToHand" }
@@ -1690,8 +1697,10 @@ export type GameEvent =
   | { type: "DebugPermissionGranted"; data: { host: PlayerId; player_id: PlayerId } }
   | { type: "DebugPermissionRevoked"; data: { host: PlayerId; player_id: PlayerId } }
   // CR 706: a die was rolled. Animated by DiceRollOverlay. `sides`/`result` are
-  // the engine's authoritative roll (1..=sides after modifiers).
-  | { type: "DieRolled"; data: { player_id: PlayerId; sides: number; result: number } }
+  // the engine's authoritative roll (1..=sides after modifiers). `result` is
+  // `null` for the symbolic planar die (CR 901.9d / CR 706.7), which has no
+  // numeric face value to animate.
+  | { type: "DieRolled"; data: { player_id: PlayerId; sides: number; result: number | null } }
   // CR 103.1: the starting-player d20 roll-off as one structured event. `rounds`
   // preserves the round boundaries (round 1 = every seat; each later round = the
   // previous round's tied-max group that rerolled); `winner` is the engine's
@@ -1717,6 +1726,33 @@ export interface CommanderDamageView {
   victim: PlayerId;
   commander: ObjectId;
   damage: number;
+}
+
+/**
+ * Presentation-only discriminant for a player-affecting continuous condition.
+ * Mirrors `engine::game::derived_views::PlayerConditionKind` (serde
+ * tag="type", content="data"). The FE maps each kind to an icon + i18n label
+ * and never re-derives the condition from static abilities — the engine
+ * aggregates the authoritative state into `DerivedViews.player_status`.
+ */
+export type PlayerConditionKind =
+  | { type: "CantWin" }
+  | { type: "CantGainLife" }
+  | { type: "CantLoseLife" }
+  | { type: "CantPayLifeAsCost" }
+  | { type: "CantCastSpells" }
+  | { type: "CantActivateAbilities" }
+  | { type: "CastOnlyFromZones"; data: { allowed_zones: Zone[] } };
+
+/**
+ * One player-status row. Mirrors `engine::game::derived_views::PlayerStatusView`.
+ * `source` is the imposing permanent when the engine surfaces it (stored
+ * restrictions / epic locks); absent for statics-scanned life/cost conditions.
+ */
+export interface PlayerStatusView {
+  player: PlayerId;
+  kind: PlayerConditionKind;
+  source?: ObjectId | null;
 }
 
 /**
@@ -1756,7 +1792,49 @@ export interface DerivedViews {
    *  own hand (incl. granted). Keyed by hand ObjectId (string). Mirrors
    *  engine::game::derived_views::DerivedViews::web_slinging_costs. */
   web_slinging_costs?: Record<string, ManaCost>;
+  /**
+   * Player-affecting continuous conditions (can't gain life, can't cast, etc.)
+   * the HUD renders as status icons. Engine-aggregated from static abilities +
+   * stored restrictions/epic locks so the FE never re-scans statics. Empty/
+   * omitted when no player is afflicted. Mirrors
+   * `engine::game::derived_views::DerivedViews::player_status`.
+   */
+  player_status?: PlayerStatusView[];
 }
+
+/** Mirrors `engine::types::game_state::NextSpellModifier` (serde tag="type"). */
+export type NextSpellModifier =
+  | { type: "CantBeCountered" }
+  | { type: "HasKeyword"; keyword: Keyword }
+  | { type: "CastAsThoughFlash" }
+  | { type: "WithoutPayingManaCost" };
+
+/** CR 601.2f: a one-shot modifier applied to a player's next qualifying spell.
+ *  Mirrors `engine::types::game_state::PendingNextSpellModifier`. */
+export interface PendingNextSpellModifier {
+  player: PlayerId;
+  modifier: NextSpellModifier;
+  spell_filter?: TargetFilter | null;
+}
+
+/** CR 601.2f: a one-shot mana reduction for a player's next qualifying spell.
+ *  Mirrors `engine::types::game_state::PendingSpellCostReduction`. */
+export interface PendingSpellCostReduction {
+  player: PlayerId;
+  amount: number;
+  spell_filter?: TargetFilter | null;
+}
+
+/** CR 702.50a: a rest-of-game Epic effect locking its controller out of
+ *  casting. Mirrors `engine::types::game_state::EpicEffect` (`spell` omitted —
+ *  the FE only needs the controller + prototype for display). */
+export interface EpicEffect {
+  controller: PlayerId;
+  prototype_id: ObjectId;
+}
+
+/** CR 731: the day/night designation, absent when neither is in effect. */
+export type DayNight = "Day" | "Night";
 
 export interface GameState {
   turn_number: number;
@@ -1853,6 +1931,17 @@ export interface GameState {
   /** CR 701.20e: the player to whom `private_look_ids` is visible (the looker). */
   private_look_player?: PlayerId;
   restrictions?: GameRestriction[];
+  /** CR 601.2f: pending one-shot modifiers for each player's next qualifying
+   *  spell (copy, flash, can't-be-countered, free cast). Surfaced as a HUD
+   *  "next spell" badge. Empty/omitted when none pending. */
+  pending_next_spell_modifiers?: PendingNextSpellModifier[];
+  /** CR 601.2f: pending one-shot cost reductions for each player's next
+   *  qualifying spell. */
+  pending_next_spell_cost_reductions?: PendingSpellCostReduction[];
+  /** CR 702.50a: active rest-of-game Epic locks (controller can't cast). */
+  epic_effects?: EpicEffect[];
+  /** CR 731: current day/night designation, absent when neither is in effect. */
+  day_night?: DayNight | null;
   command_zone?: ObjectId[];
   auto_pass?: Record<number, AutoPassMode>;
   phase_stops?: Record<number, Phase[]>;
