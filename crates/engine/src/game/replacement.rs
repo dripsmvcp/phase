@@ -3132,16 +3132,29 @@ fn evaluate_replacement_condition(
                 ..
             }
         ),
-        // CR 614.1a + CR 111.1: "if you would create one or more <subtype> tokens" —
-        // applies iff the proposed CreateToken event's spec subtypes overlap any
-        // listed subtype. Non-CreateToken events never match this condition.
-        ReplacementCondition::TokenSubtypeMatches { subtypes } => match event {
-            ProposedEvent::CreateToken { spec, .. } => subtypes.iter().any(|wanted| {
-                spec.characteristics
-                    .subtypes
-                    .iter()
-                    .any(|got| got.eq_ignore_ascii_case(wanted))
-            }),
+        // CR 614.1a + CR 111.1: "if you would create one or more <subtype/type>
+        // tokens" — applies iff the proposed CreateToken event's spec matches
+        // every *non-empty* characteristic axis (CR 205.2 core types and/or
+        // CR 205.3 subtypes). An empty axis is unconstrained. Non-CreateToken
+        // events never match this condition.
+        ReplacementCondition::TokenSpecMatches {
+            subtypes,
+            core_types,
+        } => match event {
+            ProposedEvent::CreateToken { spec, .. } => {
+                let subtype_ok = subtypes.is_empty()
+                    || subtypes.iter().any(|wanted| {
+                        spec.characteristics
+                            .subtypes
+                            .iter()
+                            .any(|got| got.eq_ignore_ascii_case(wanted))
+                    });
+                let core_type_ok = core_types.is_empty()
+                    || core_types
+                        .iter()
+                        .any(|wanted| spec.characteristics.core_types.contains(wanted));
+                subtype_ok && core_type_ok
+            }
             _ => false,
         },
         // CR 121.1 + CR 504.1 + CR 614.6: "except the first one you draw in
@@ -9840,6 +9853,133 @@ mod tests {
             .all(|o| o.owner == PlayerId(0)));
     }
 
+    /// CR 614.1a + CR 205.2: Stridehangar Automaton's *core-type*-gated
+    /// expansion (issue #654) — a created **artifact** token gains an additional
+    /// Thopter, but a non-artifact (creature-only) token does not, proving the
+    /// `TokenSpecMatches { core_types: [Artifact] }` gate is evaluated at apply
+    /// time rather than firing on every CreateToken event.
+    #[test]
+    fn create_token_core_type_gate_expands_only_artifact_tokens() {
+        use crate::types::card_type::CoreType;
+        use crate::types::proposed_event::TokenCharacteristics;
+
+        fn thopter_spec() -> TokenSpec {
+            TokenSpec {
+                characteristics: TokenCharacteristics {
+                    display_name: "Thopter".to_string(),
+                    power: Some(1),
+                    toughness: Some(1),
+                    core_types: vec![CoreType::Artifact, CoreType::Creature],
+                    subtypes: vec!["Thopter".to_string()],
+                    supertypes: Vec::new(),
+                    colors: Vec::new(),
+                    keywords: vec![crate::types::keywords::Keyword::Flying],
+                },
+                script_name: "Thopter".to_string(),
+                static_abilities: Vec::new(),
+                enter_with_counters: Vec::new(),
+                tapped: false,
+                enters_attacking: false,
+                sacrifice_at: None,
+                source_id: ObjectId(0),
+                controller: PlayerId(0),
+                attach_to: None,
+            }
+        }
+
+        fn run(primary: TokenSpec) -> usize {
+            let stridehangar = ObjectId(900);
+            let repl = ReplacementDefinition::new(ReplacementEvent::CreateToken)
+                .condition(ReplacementCondition::TokenSpecMatches {
+                    subtypes: vec![],
+                    core_types: vec![CoreType::Artifact],
+                })
+                .token_owner_scope(ControllerRef::You)
+                .additional_token_spec(thopter_spec());
+            let mut state = test_state_with_object(stridehangar, Zone::Battlefield, vec![repl]);
+            let mut events = Vec::new();
+            let proposed = ProposedEvent::CreateToken {
+                owner: PlayerId(0),
+                spec: Box::new(primary),
+                copy: None,
+                enter_tapped: EtbTapState::Unspecified,
+                count: 1,
+                applied: HashSet::new(),
+            };
+            match replace_event(&mut state, proposed, &mut events) {
+                ReplacementResult::Execute(primary) => {
+                    crate::game::effects::token::apply_create_token_after_replacement(
+                        &mut state,
+                        primary,
+                        &mut events,
+                    );
+                }
+                other => panic!("expected Execute; got {other:?}"),
+            }
+            state
+                .objects
+                .values()
+                .filter(|o| o.is_token && o.card_types.subtypes.iter().any(|s| s == "Thopter"))
+                .count()
+        }
+
+        // CR 111.10a: a Treasure token is an artifact — the gate fires.
+        let treasure = TokenSpec {
+            characteristics: TokenCharacteristics {
+                display_name: "Treasure".to_string(),
+                power: None,
+                toughness: None,
+                core_types: vec![CoreType::Artifact],
+                subtypes: vec!["Treasure".to_string()],
+                supertypes: Vec::new(),
+                colors: Vec::new(),
+                keywords: Vec::new(),
+            },
+            script_name: "Treasure".to_string(),
+            static_abilities: Vec::new(),
+            enter_with_counters: Vec::new(),
+            tapped: false,
+            enters_attacking: false,
+            sacrifice_at: None,
+            source_id: ObjectId(900),
+            controller: PlayerId(0),
+            attach_to: None,
+        };
+        assert_eq!(
+            run(treasure),
+            1,
+            "artifact token creation must spawn the additional Thopter"
+        );
+
+        // A creature-only token is not an artifact — the gate must NOT fire.
+        let plant = TokenSpec {
+            characteristics: TokenCharacteristics {
+                display_name: "Plant".to_string(),
+                power: Some(0),
+                toughness: Some(2),
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Plant".to_string()],
+                supertypes: Vec::new(),
+                colors: vec![crate::types::mana::ManaColor::Green],
+                keywords: Vec::new(),
+            },
+            script_name: "Plant".to_string(),
+            static_abilities: Vec::new(),
+            enter_with_counters: Vec::new(),
+            tapped: false,
+            enters_attacking: false,
+            sacrifice_at: None,
+            source_id: ObjectId(900),
+            controller: PlayerId(0),
+            attach_to: None,
+        };
+        assert_eq!(
+            run(plant),
+            0,
+            "non-artifact token creation must not spawn a Thopter"
+        );
+    }
+
     /// CR 614.1a + CR 111.1: Manufactor's "ensure one of each" — when the
     /// proposed event creates a Treasure, the applier emits Clue and Food
     /// recursively, but does NOT re-emit Treasure (already present in the
@@ -9875,12 +10015,13 @@ mod tests {
 
         let manufactor = ObjectId(700);
         let repl = ReplacementDefinition::new(ReplacementEvent::CreateToken)
-            .condition(ReplacementCondition::TokenSubtypeMatches {
+            .condition(ReplacementCondition::TokenSpecMatches {
                 subtypes: vec![
                     "Clue".to_string(),
                     "Food".to_string(),
                     "Treasure".to_string(),
                 ],
+                core_types: vec![],
             })
             .ensure_token_specs(vec![
                 artifact_spec("Clue"),
@@ -10142,12 +10283,13 @@ mod tests {
         let doubling_season = ObjectId(10);
 
         let manufactor_repl = ReplacementDefinition::new(ReplacementEvent::CreateToken)
-            .condition(ReplacementCondition::TokenSubtypeMatches {
+            .condition(ReplacementCondition::TokenSpecMatches {
                 subtypes: vec![
                     "Clue".to_string(),
                     "Food".to_string(),
                     "Treasure".to_string(),
                 ],
+                core_types: vec![],
             })
             .ensure_token_specs(vec![
                 artifact_spec("Clue"),
@@ -10260,12 +10402,13 @@ mod tests {
         // CR 614.1a + CR 109.5: `token_owner_scope(You)` is what the parser now
         // emits for the "if you would create" Manufactor shape.
         let manufactor_repl = ReplacementDefinition::new(ReplacementEvent::CreateToken)
-            .condition(ReplacementCondition::TokenSubtypeMatches {
+            .condition(ReplacementCondition::TokenSpecMatches {
                 subtypes: vec![
                     "Clue".to_string(),
                     "Food".to_string(),
                     "Treasure".to_string(),
                 ],
+                core_types: vec![],
             })
             .token_owner_scope(ControllerRef::You)
             .ensure_token_specs(vec![

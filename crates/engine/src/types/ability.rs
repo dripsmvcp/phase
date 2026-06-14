@@ -11753,17 +11753,25 @@ pub enum ReplacementCondition {
     /// Used by Stranglehold ("If a player would begin an extra turn...").
     /// Evaluated by `begin_turn_matcher` against `ProposedEvent::BeginTurn`.
     OnlyExtraTurn,
-    /// CR 614.1a + CR 111.1: Gate a `CreateToken` replacement on whether the
-    /// proposed event creates a token whose subtypes overlap a fixed set.
-    /// Used by Xorn ("if you would create one or more Treasure tokens, …") and
-    /// Academy Manufactor ("if you would create a Clue, Food, or Treasure
-    /// token, …"). Subtype strings are matched case-insensitively against the
-    /// proposed `TokenSpec.subtypes`. Substantive subtype canonicalization
-    /// remains the parser's job.
+    /// CR 614.1a + CR 111.1: Gate a `CreateToken` replacement on the proposed
+    /// token's characteristics. The replacement applies iff, for every *non-empty*
+    /// axis below, the proposed `TokenSpec` overlaps the listed values:
     ///
-    /// `subtypes` is `Vec<String>` to mirror the existing `TokenSpec.subtypes`
-    /// shape; introducing a typed `Subtype` enum is a separate, broader refactor.
-    TokenSubtypeMatches { subtypes: Vec<String> },
+    /// - `subtypes` (CR 205.3): Xorn ("if you would create one or more Treasure
+    ///   tokens, …") and Academy Manufactor ("…a Clue, Food, or Treasure token,
+    ///   …"). Matched case-insensitively against `TokenSpec.characteristics.subtypes`.
+    /// - `core_types` (CR 205.2): Stridehangar Automaton ("if one or more
+    ///   *artifact* tokens would be created …"). Matched against
+    ///   `TokenSpec.characteristics.core_types`.
+    ///
+    /// An empty axis is unconstrained; both empty matches any token. The two
+    /// axes are distinct CR-205 characteristic lists, so they are parameterized
+    /// here rather than split into sibling variants. `subtypes` stays `Vec<String>`
+    /// to mirror `TokenSpec.subtypes`; a typed `Subtype` enum is a broader refactor.
+    TokenSpecMatches {
+        subtypes: Vec<String>,
+        core_types: Vec<CoreType>,
+    },
     /// CR 121.1 + CR 504.1 + CR 614.6: "except the first one you draw in each
     /// of your draw steps" — the replacement applies to every card-draw EXCEPT
     /// the draw step's mandatory first draw (the active player's CR 504.1

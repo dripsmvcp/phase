@@ -4253,6 +4253,17 @@ fn parse_token_replacement(lower: &str, original_text: &str) -> Option<Replaceme
 
     let modification_mode = parse_token_replacement_shape(lower)?;
 
+    // CR 205.2 + CR 614.1a: optional characteristic gate — "if one or more
+    // <type> tokens would be created" restricts the replacement to tokens of a
+    // given core type (Stridehangar Automaton: "artifact") or subtype (passive
+    // Xorn form). The ungated "one or more tokens" form (Chatterfang, Doubling
+    // Season) applies to every token. An unmodeled multi-word qualifier bails so
+    // the replacement never fires ungated on tokens it shouldn't expand.
+    let gate = parse_token_replacement_gate(lower);
+    if matches!(gate, TokenGate::Unsupported) {
+        return None;
+    }
+
     let mut def = ReplacementDefinition::new(ReplacementEvent::CreateToken)
         .description(original_text.to_string());
 
@@ -4265,12 +4276,80 @@ fn parse_token_replacement(lower: &str, original_text: &str) -> Option<Replaceme
         }
     }
 
+    if let TokenGate::Gated {
+        subtypes,
+        core_types,
+    } = gate
+    {
+        def = def.condition(ReplacementCondition::TokenSpecMatches {
+            subtypes,
+            core_types,
+        });
+    }
+
     // Scope: "under your control" → restrict to controller's tokens
     if nom_primitives::scan_contains(lower, "under your control") {
         def = def.token_owner_scope(ControllerRef::You);
     }
 
     Some(def)
+}
+
+/// Outcome of inspecting the "if one or more <qualifier> tokens would be
+/// created" gate of a token-creation replacement (CR 614.1a + CR 205).
+enum TokenGate {
+    /// No characteristic qualifier — applies to every created token (Chatterfang,
+    /// Doubling Season).
+    Ungated,
+    /// A single-axis gate parsed from the qualifier.
+    Gated {
+        subtypes: Vec<String>,
+        core_types: Vec<crate::types::card_type::CoreType>,
+    },
+    /// A qualifier was present but isn't modeled (multi-word) — caller must bail
+    /// rather than emit an ungated replacement.
+    Unsupported,
+}
+
+/// CR 205.2 + CR 205.3: Classify the optional token qualifier in
+/// "if one or more <qualifier> token(s) would be created". An empty/absent
+/// qualifier is [`TokenGate::Ungated`]; a single word resolves to a core-type
+/// gate (CR 205.2, e.g. "artifact") or, failing that, a subtype gate
+/// (CR 205.3, e.g. a passive "Treasure" form); a multi-word qualifier is
+/// [`TokenGate::Unsupported`].
+fn parse_token_replacement_gate(lower: &str) -> TokenGate {
+    let qualifier = nom_on_lower(lower, lower, |i| {
+        let (i, _) = take_until::<_, _, OracleError<'_>>("one or more ").parse(i)?;
+        let (i, _) = tag("one or more ").parse(i)?;
+        let (i, q) = alt((
+            take_until::<_, _, OracleError<'_>>(" tokens would be created"),
+            take_until::<_, _, OracleError<'_>>(" token would be created"),
+        ))
+        .parse(i)?;
+        Ok((i, q.to_string()))
+    });
+    let qualifier = match &qualifier {
+        Some((q, _)) => q.trim(),
+        None => return TokenGate::Ungated,
+    };
+    if qualifier.is_empty() {
+        return TokenGate::Ungated;
+    }
+    if qualifier.contains(' ') {
+        return TokenGate::Unsupported;
+    }
+    let canonical = canonicalize_subtype(qualifier);
+    if let Ok(core) = canonical.parse::<crate::types::card_type::CoreType>() {
+        TokenGate::Gated {
+            subtypes: vec![],
+            core_types: vec![core],
+        }
+    } else {
+        TokenGate::Gated {
+            subtypes: vec![canonical],
+            core_types: vec![],
+        }
+    }
 }
 
 enum TokenReplacementShape {
@@ -4315,6 +4394,19 @@ fn parse_token_replacement_shape(lower: &str) -> Option<TokenReplacementShape> {
     let descriptor = lower
         .get(descriptor_start..descriptor_start + descriptor_len)?
         .trim();
+    // CR 111.1: "those tokens plus an additional <spec>" (Stridehangar Automaton)
+    // carries an "[a|an ]additional " modifier with no count word; strip it and
+    // re-add the article `parse_token_description` requires as a count prefix.
+    // The Chatterfang form ("plus that many 1/1 … tokens") keeps its own count
+    // word and parses unchanged.
+    let normalized_owned;
+    let descriptor = match strip_additional_modifier(descriptor) {
+        Some(core) => {
+            normalized_owned = format!("a {core}");
+            normalized_owned.as_str()
+        }
+        None => descriptor,
+    };
     let token = super::oracle_effect::parse_token_description(descriptor)?;
     let spec = token_description_to_spec(&token)?;
     Some(TokenReplacementShape::PlusSpec {
@@ -4332,7 +4424,7 @@ fn parse_token_replacement_shape(lower: &str) -> Option<TokenReplacementShape> {
 ///
 /// Differs from `parse_token_replacement` (Chatterfang) in two ways:
 /// (1) the original event already creates tokens of the listed subtype, so a
-/// `ReplacementCondition::TokenSubtypeMatches` gate is emitted; (2) the
+/// `ReplacementCondition::TokenSpecMatches` subtype gate is emitted; (2) the
 /// "instead create those tokens plus X" word order is inverted from
 /// Chatterfang's "those tokens plus X are created instead." Manufactor
 /// ("instead create one of each") shares the same prefix and is parsed
@@ -4410,8 +4502,9 @@ fn parse_xorn_subtype_token_replacement(
 
     Some(
         ReplacementDefinition::new(ReplacementEvent::CreateToken)
-            .condition(ReplacementCondition::TokenSubtypeMatches {
+            .condition(ReplacementCondition::TokenSpecMatches {
                 subtypes: vec![canonical_subtype],
+                core_types: vec![],
             })
             // CR 614.1a + CR 109.5: "If *you* would create..." scopes the
             // replacement to the source's controller — it must not fire for
@@ -4420,6 +4513,17 @@ fn parse_xorn_subtype_token_replacement(
             .additional_token_spec(spec)
             .description(original_text.to_string()),
     )
+}
+
+/// CR 111.1: Strip a leading "[a|an ]additional " modifier from a "those tokens
+/// plus …" descriptor (Stridehangar Automaton's "an additional 1/1 … token").
+/// Returns the remaining spec text when the modifier is present; `None` leaves
+/// count-prefixed descriptors (Chatterfang's "that many …") untouched.
+fn strip_additional_modifier(descriptor: &str) -> Option<&str> {
+    descriptor
+        .strip_prefix("an additional ")
+        .or_else(|| descriptor.strip_prefix("a additional "))
+        .or_else(|| descriptor.strip_prefix("additional "))
 }
 
 /// Title-case a single-word subtype string for canonical TokenSpec storage.
@@ -4445,7 +4549,7 @@ fn canonicalize_subtype(s: &str) -> String {
 /// (or any 2+ subtype list with `, or ` before the final entry). Returns a
 /// `ReplacementDefinition` whose:
 ///
-/// - `condition` is `TokenSubtypeMatches { subtypes: [S1, S2, S3] }` so the
+/// - `condition` is `TokenSpecMatches { subtypes: [S1, S2, S3], .. }` so the
 ///   replacement only fires for events whose proposed token spec carries one
 ///   of the listed subtypes;
 /// - `ensure_token_specs` is the parallel list of full `TokenSpec`s, one per
@@ -4490,8 +4594,9 @@ fn parse_manufactor_ensure_all_token_replacement(
 
     Some(
         ReplacementDefinition::new(ReplacementEvent::CreateToken)
-            .condition(ReplacementCondition::TokenSubtypeMatches {
+            .condition(ReplacementCondition::TokenSpecMatches {
                 subtypes: condition_subtypes,
+                core_types: vec![],
             })
             // CR 614.1a + CR 109.5: "If *you* would create..." scopes the
             // replacement to the source's controller — it must not fire for
@@ -10581,7 +10686,7 @@ mod tests {
     }
 
     /// CR 614.1a + CR 111.1 + CR 111.10a: Xorn's full Oracle text parses to a
-    /// CreateToken replacement with a `TokenSubtypeMatches { ["Treasure"] }`
+    /// CreateToken replacement with a `TokenSpecMatches { ["Treasure"] }`
     /// gate and an `additional_token_spec` carrying the Treasure spec.
     /// (CR 111.10a defines the Treasure token, verified via
     /// `grep '^111.10a' docs/MagicCompRules.txt` — earlier "111.10p" was wrong;
@@ -10594,14 +10699,14 @@ mod tests {
 
         assert_eq!(def.event, ReplacementEvent::CreateToken);
         match &def.condition {
-            Some(ReplacementCondition::TokenSubtypeMatches { subtypes }) => {
+            Some(ReplacementCondition::TokenSpecMatches { subtypes, .. }) => {
                 assert_eq!(
                     subtypes,
                     &vec!["Treasure".to_string()],
                     "Xorn gates on Treasure subtype"
                 );
             }
-            other => panic!("Expected TokenSubtypeMatches, got {other:?}"),
+            other => panic!("Expected TokenSpecMatches, got {other:?}"),
         }
         // CR 614.1a + CR 109.5: "If you would create..." is scoped to the
         // source's controller, so the replacement must not fire for tokens
@@ -10625,6 +10730,95 @@ mod tests {
         );
     }
 
+    /// CR 614.1a + CR 205.2: Stridehangar Automaton's passive, *core-type*-gated
+    /// "those tokens plus an additional <full spec>" replacement (issue #654).
+    /// Distinct from the Xorn subtype gate: the qualifier "artifact" is a CR
+    /// 205.2 card type, so the gate populates `core_types`, not `subtypes`, and
+    /// the appended spec is a full 1/1 flying Thopter rather than a bare subtype.
+    #[test]
+    fn parses_stridehangar_artifact_token_expansion_cr_614_1a() {
+        let text = "If one or more artifact tokens would be created under your control, those tokens plus an additional 1/1 colorless Thopter artifact creature token with flying are created instead.";
+        let def = parse_replacement_line(text, "Stridehangar Automaton")
+            .expect("should parse Stridehangar token-expansion replacement");
+
+        assert_eq!(def.event, ReplacementEvent::CreateToken);
+        match &def.condition {
+            Some(ReplacementCondition::TokenSpecMatches {
+                subtypes,
+                core_types,
+            }) => {
+                assert!(
+                    subtypes.is_empty(),
+                    "core-type gate must not populate the subtype axis, got {subtypes:?}"
+                );
+                assert_eq!(
+                    core_types,
+                    &vec![crate::types::card_type::CoreType::Artifact],
+                    "Stridehangar gates on the Artifact core type (CR 205.2)"
+                );
+            }
+            other => panic!("Expected TokenSpecMatches core-type gate, got {other:?}"),
+        }
+        // CR 614.1a + CR 109.5: "under your control" scopes to the controller.
+        assert_eq!(
+            def.token_owner_scope,
+            Some(ControllerRef::You),
+            "'under your control' must scope the expansion to the controller's tokens"
+        );
+        let spec = def
+            .additional_token_spec
+            .as_ref()
+            .expect("Stridehangar must populate additional_token_spec");
+        assert_eq!(
+            spec.characteristics.power,
+            Some(1),
+            "appended Thopter is 1/1, got power {:?}",
+            spec.characteristics.power
+        );
+        assert!(
+            spec.characteristics
+                .subtypes
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case("Thopter")),
+            "appended spec must be a Thopter token, got {:?}",
+            spec.characteristics.subtypes
+        );
+        assert!(
+            spec.characteristics
+                .core_types
+                .contains(&crate::types::card_type::CoreType::Artifact),
+            "appended Thopter is an artifact creature, got {:?}",
+            spec.characteristics.core_types
+        );
+        assert!(
+            spec.characteristics
+                .keywords
+                .contains(&crate::types::keywords::Keyword::Flying),
+            "appended Thopter must have flying, got {:?}",
+            spec.characteristics.keywords
+        );
+    }
+
+    /// CR 614.1a: The ungated Chatterfang form ("one or more tokens", no
+    /// characteristic qualifier) must remain unconditional — the new gate logic
+    /// must not regress it into a spuriously-gated replacement.
+    #[test]
+    fn chatterfang_token_expansion_stays_ungated_cr_614_1a() {
+        let text = "If one or more tokens would be created under your control, those tokens plus that many 1/1 green Squirrel creature tokens are created instead.";
+        let def = parse_replacement_line(text, "Chatterfang, Squirrel General")
+            .expect("should parse Chatterfang token-expansion replacement");
+        assert_eq!(def.event, ReplacementEvent::CreateToken);
+        assert!(
+            def.condition.is_none(),
+            "ungated 'one or more tokens' must carry no TokenSpecMatches gate, got {:?}",
+            def.condition
+        );
+        assert!(
+            def.additional_token_spec.is_some(),
+            "Chatterfang must still append its Squirrel spec"
+        );
+    }
+
     /// CR 614.1a + CR 111.1: Academy Manufactor's "instead create one of each"
     /// parses to a CreateToken replacement whose `condition` lists all three
     /// gated subtypes and whose `ensure_token_specs` carries a TokenSpec for
@@ -10639,7 +10833,7 @@ mod tests {
 
         assert_eq!(def.event, ReplacementEvent::CreateToken);
         match &def.condition {
-            Some(ReplacementCondition::TokenSubtypeMatches { subtypes }) => {
+            Some(ReplacementCondition::TokenSpecMatches { subtypes, .. }) => {
                 assert_eq!(
                     subtypes,
                     &vec![
@@ -10650,7 +10844,7 @@ mod tests {
                     "condition must gate on all three subtypes"
                 );
             }
-            other => panic!("Expected TokenSubtypeMatches, got {other:?}"),
+            other => panic!("Expected TokenSpecMatches, got {other:?}"),
         }
 
         // CR 614.1a + CR 109.5: "If you would create..." is scoped to the
