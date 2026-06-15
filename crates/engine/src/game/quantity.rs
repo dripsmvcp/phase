@@ -996,13 +996,37 @@ pub(crate) fn object_count_matching_ids(
     filter_ctx: &FilterContext<'_>,
     source_id: ObjectId,
 ) -> Vec<ObjectId> {
-    let zone = filter
-        .extract_in_zone()
-        .unwrap_or(crate::types::zones::Zone::Battlefield);
-    let mut ids: Vec<ObjectId> = crate::game::targeting::zone_object_ids(state, zone)
-        .into_iter()
-        .filter(|&id| matches_target_filter(state, id, filter, filter_ctx))
-        .collect();
+    // CR 400.1: scan every zone the filter constrains, not just the first.
+    // `extract_zones()` preserves multi-zone (`InAnyZone`) semantics — e.g. a
+    // "commander you own on the battlefield or in the command zone" filter — that
+    // `extract_in_zone()` would collapse to a single zone, silently dropping the
+    // command-zone half of the population. A single `InZone` still yields exactly
+    // one zone, and a zone-less filter falls back to the battlefield default, so
+    // existing single-zone counts and aggregates are unchanged.
+    let zones = {
+        let mut zs = filter.extract_zones();
+        // `extract_zones()` covers explicit `InZone`/`InAnyZone` constraints but
+        // not the implicit zones some filter variants carry (e.g.
+        // `ExiledBySource` ⇒ Exile). Union in `extract_in_zone()` so every zone
+        // the single-zone path used to reach is still scanned.
+        if let Some(z) = filter.extract_in_zone() {
+            if !zs.contains(&z) {
+                zs.push(z);
+            }
+        }
+        if zs.is_empty() {
+            zs.push(crate::types::zones::Zone::Battlefield);
+        }
+        zs
+    };
+    let mut ids: Vec<ObjectId> = Vec::new();
+    for zone in zones {
+        for id in crate::game::targeting::zone_object_ids(state, zone) {
+            if !ids.contains(&id) && matches_target_filter(state, id, filter, filter_ctx) {
+                ids.push(id);
+            }
+        }
+    }
     // Drop the triggering object for an "other than" filter (Valakut's "five
     // other Mountains" — the newly-entered Mountain matches the per-object filter
     // as a pass-through and is removed here). The exclusion is the Oracle-text
@@ -8514,6 +8538,89 @@ mod tests {
             },
         };
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 7);
+    }
+
+    #[test]
+    fn resolve_commander_mana_value_spans_command_zone_and_battlefield() {
+        // CR 202.3: Stinging Study's "X is the mana value of a commander you own
+        // on the battlefield or in the command zone" must count commanders in
+        // EITHER zone. A command-zone commander is reached only because
+        // `object_count_matching_ids` scans every zone the filter names (here
+        // battlefield + command) and `zone_object_ids` returns the command zone's
+        // objects. Reverting either of those drops the command-zone commander and
+        // this resolves to the wrong value.
+        let mut state = GameState::new_two_player(7);
+
+        // PlayerId(0): a command-zone commander (MV 6) and a battlefield commander
+        // (MV 4). Max across both zones is 6.
+        let cmd_command = create_object(
+            &mut state,
+            CardId(50),
+            PlayerId(0),
+            "Command-Zone Commander".to_string(),
+            Zone::Command,
+        );
+        {
+            let obj = state.objects.get_mut(&cmd_command).unwrap();
+            obj.is_commander = true;
+            obj.mana_cost = crate::types::mana::ManaCost::generic(6);
+        }
+        let cmd_battlefield = create_object(
+            &mut state,
+            CardId(51),
+            PlayerId(0),
+            "Battlefield Commander".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&cmd_battlefield).unwrap();
+            obj.is_commander = true;
+            obj.mana_cost = crate::types::mana::ManaCost::generic(4);
+        }
+
+        // PlayerId(1)'s own command-zone commander (MV 9) — only counts for its
+        // owner, never for PlayerId(0).
+        let opp_cmd = create_object(
+            &mut state,
+            CardId(52),
+            PlayerId(1),
+            "Opponent Commander".to_string(),
+            Zone::Command,
+        );
+        {
+            let obj = state.objects.get_mut(&opp_cmd).unwrap();
+            obj.is_commander = true;
+            obj.mana_cost = crate::types::mana::ManaCost::generic(9);
+        }
+
+        let source = create_object(
+            &mut state,
+            CardId(60),
+            PlayerId(0),
+            "Stinging Study".to_string(),
+            Zone::Stack,
+        );
+
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::Aggregate {
+                function: AggregateFunction::Max,
+                property: ObjectProperty::ManaValue,
+                filter: TargetFilter::Typed(TypedFilter::default().properties(vec![
+                    crate::types::ability::FilterProp::IsCommander,
+                    crate::types::ability::FilterProp::Owned {
+                        controller: ControllerRef::You,
+                    },
+                    crate::types::ability::FilterProp::InAnyZone {
+                        zones: vec![Zone::Battlefield, Zone::Command],
+                    },
+                ])),
+            },
+        };
+
+        // Owner 0 sees MV 6 (command) and MV 4 (battlefield) → Max 6.
+        assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 6);
+        // Owner 1 sees only their MV-9 command-zone commander.
+        assert_eq!(resolve_quantity(&state, &expr, PlayerId(1), source), 9);
     }
 
     #[test]

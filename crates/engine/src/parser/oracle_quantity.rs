@@ -236,6 +236,48 @@ pub(crate) fn parse_quantity_ref_with_context(
         }
     }
 
+    // CR 202.3: "[the greatest] mana value of a commander you own on the
+    // battlefield or in the command zone" (Stinging Study's effect X; the
+    // Flashback cost-reduction cycle uses the "greatest" wording). A commander
+    // is a permanent on the battlefield or a card in the command zone, so the
+    // population spans both zones (`InAnyZone`); with multiple owned commanders
+    // (partners) the greatest value is taken. Reuses `Aggregate { Max, ManaValue }`
+    // — `object_count_matching_ids` now scans every zone the filter names, so the
+    // command-zone commander is counted. Placed before the "among" aggregate
+    // block so the whole "of a commander you own …" phrase is claimed here.
+    if let Ok((rest, _)) = (
+        alt((
+            tag::<_, _, OracleError<'_>>("the greatest mana value of a commander you own "),
+            tag("the mana value of a commander you own "),
+        )),
+        alt((
+            tag("on the battlefield or in the command zone"),
+            tag("in the command zone or on the battlefield"),
+        )),
+    )
+        .parse(trimmed)
+    {
+        if rest.is_empty() {
+            return Some(QuantityRef::Aggregate {
+                function: AggregateFunction::Max,
+                property: ObjectProperty::ManaValue,
+                filter: TargetFilter::Typed(TypedFilter {
+                    type_filters: Vec::new(),
+                    controller: None,
+                    properties: vec![
+                        FilterProp::IsCommander,
+                        FilterProp::Owned {
+                            controller: ControllerRef::You,
+                        },
+                        FilterProp::InAnyZone {
+                            zones: vec![Zone::Battlefield, Zone::Command],
+                        },
+                    ],
+                }),
+            });
+        }
+    }
+
     // Aggregate patterns: "the greatest X among" / "the total power of"
     if let Ok((rest, (func, prop))) = alt((
         value(
@@ -4000,6 +4042,41 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn cda_quantity_commander_mana_value_across_battlefield_and_command_zone() {
+        // CR 202.3: Stinging Study's effect X ("the mana value of a commander
+        // you own on the battlefield or in the command zone") and the Flashback
+        // cost-reduction cycle's "greatest" wording both resolve to a Max/ManaValue
+        // aggregate over a commander-you-own filter spanning both zones.
+        let expected = QuantityExpr::Ref {
+            qty: QuantityRef::Aggregate {
+                function: AggregateFunction::Max,
+                property: ObjectProperty::ManaValue,
+                filter: TargetFilter::Typed(TypedFilter::default().properties(vec![
+                    FilterProp::IsCommander,
+                    FilterProp::Owned {
+                        controller: ControllerRef::You,
+                    },
+                    FilterProp::InAnyZone {
+                        zones: vec![Zone::Battlefield, Zone::Command],
+                    },
+                ])),
+            },
+        };
+        assert_eq!(
+            parse_cda_quantity(
+                "the mana value of a commander you own on the battlefield or in the command zone"
+            ),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            parse_cda_quantity(
+                "the greatest mana value of a commander you own on the battlefield or in the command zone"
+            ),
+            Some(expected)
+        );
     }
 
     #[test]

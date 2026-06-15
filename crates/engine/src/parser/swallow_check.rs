@@ -3978,9 +3978,15 @@ mod tests {
 
     #[test]
     fn dynamic_qty_keeps_warning_when_counter_multiplier_card_has_second_dynamic_clause() {
+        // The second clause is a genuinely-swallowed dynamic: `parse_where_x_quantity_expression`
+        // returns `None` for any "where X is the number of times …" binding, so no
+        // `QuantityExpr` is captured and the DynamicQty warning must still fire even though
+        // the counter-multiplier first clause is present. (Previously this used a "greatest
+        // mana value of a commander you own …" flashback clause, which the parser now
+        // captures as an `Aggregate { ManaValue }` ref — no longer a swallowed dynamic.)
         let parsed = parse(
             "Put a +1/+1 counter on target creature, then double the number of +1/+1 counters on it.\n\
-             Flashback {8}{G}{G}. This spell costs {X} less to cast this way, where X is the greatest mana value of a commander you own on the battlefield or in the command zone.",
+             Flashback {8}{G}{G}. This spell costs {X} less to cast this way, where X is the number of times you've cast a spell from a graveyard this game.",
             &["Sorcery"],
         );
 
