@@ -251,10 +251,18 @@ pub(crate) fn produce_mana_with_attributes_from_source_quality(
         }) => (resolved, count),
         // CR 614.1: A fully-prevented mana production produces no mana.
         ReplacementResult::Prevented => return,
-        // CR 614.5: Mana-type replacements do not require a player choice; any
-        // other outcome (including unexpected pipeline results) falls back to
-        // the original type so mana production is never silently dropped.
-        _ => (mana_type, 1),
+        // CR 605.3b + CR 616.1: A mana ability resolves immediately and never
+        // uses the stack, so it cannot pause for an interactive replacement
+        // ordering choice. When two or more applicable mana replacements are
+        // deemed order-material (e.g. a Nyxbloom-style ×3 alongside a color
+        // override), drain the pending chain deterministically — applying every
+        // candidate exactly once — rather than silently dropping the production
+        // to a single unit. Commuting multipliers never reach here (they
+        // auto-resolve in the pipeline via `mana_commute_class`).
+        ReplacementResult::NeedsChoice(_) => drain_mana_replacement_chain(state, mana_type, events),
+        // Defensive: any other unexpected pipeline result falls back to the
+        // original single unit so mana production is never silently dropped.
+        ReplacementResult::Execute(_) => (mana_type, 1),
     };
 
     for _ in 0..final_count {
@@ -284,6 +292,38 @@ pub(crate) fn produce_mana_with_attributes_from_source_quality(
     }
     if final_count > 0 {
         state.layers_dirty.mark_full();
+    }
+}
+
+/// CR 616.1 + CR 605.3b: Resolve a `ProduceMana` replacement chain that the
+/// pipeline parked for a player ordering choice (multiple order-material
+/// candidates). Because a mana ability resolves immediately without using the
+/// stack, no interactive prompt is surfaced; instead the chain is drained
+/// deterministically — `continue_replacement` applies the next candidate (index
+/// 0 of the still-applicable set) and re-runs the pipeline, which marks each
+/// candidate applied so every one is applied exactly once before a terminal
+/// `Execute`/`Prevented` is reached. Returns the final `(mana_type, count)` to
+/// add, or `(original, 0)` when the chain ultimately prevents the production.
+fn drain_mana_replacement_chain(
+    state: &mut GameState,
+    original_mana_type: ManaType,
+    events: &mut Vec<GameEvent>,
+) -> (ManaType, u32) {
+    use crate::game::replacement::{self, ReplacementResult};
+    use crate::types::proposed_event::ProposedEvent;
+
+    loop {
+        match replacement::continue_replacement(state, 0, events) {
+            ReplacementResult::Execute(ProposedEvent::ProduceMana {
+                mana_type, count, ..
+            }) => return (mana_type, count),
+            // CR 614.1: the chain ultimately prevented the production.
+            ReplacementResult::Prevented => return (original_mana_type, 0),
+            // Another order-material candidate remains — apply the next one.
+            ReplacementResult::NeedsChoice(_) => continue,
+            // Defensive: an unexpected terminal shape never drops mana silently.
+            ReplacementResult::Execute(_) => return (original_mana_type, 1),
+        }
     }
 }
 
@@ -2206,6 +2246,126 @@ mod tests {
                 tap_state: ManaTapState::FromTap,
             } if *source_id == land_id
         )));
+    }
+
+    /// Build a Forest plus the given `(name, replacement)` battlefield permanents
+    /// for P0 and tap the Forest for one Green; returns the resulting state so
+    /// the caller can inspect P0's mana pool.
+    fn produce_green_under_replacements(
+        replacements: Vec<(&str, crate::types::ability::ReplacementDefinition)>,
+    ) -> GameState {
+        use crate::game::game_object::GameObject;
+        use crate::types::card_type::CoreType;
+        use crate::types::identifiers::CardId;
+        use crate::types::zones::Zone;
+
+        let mut state = GameState::new_two_player(42);
+        let mut next = 90u64;
+        for (name, repl) in replacements {
+            let id = ObjectId(next);
+            next += 1;
+            let mut obj = GameObject::new(
+                id,
+                CardId(next),
+                PlayerId(0),
+                name.to_string(),
+                Zone::Battlefield,
+            );
+            obj.replacement_definitions = vec![repl].into();
+            state.objects.insert(id, obj);
+            state.battlefield.push_back(id);
+        }
+
+        let land_id = ObjectId(10);
+        let mut forest = GameObject::new(
+            land_id,
+            CardId(2),
+            PlayerId(0),
+            "Forest".into(),
+            Zone::Battlefield,
+        );
+        forest.card_types.core_types.push(CoreType::Land);
+        state.objects.insert(land_id, forest);
+        state.battlefield.push_back(land_id);
+
+        let mut events = Vec::new();
+        produce_mana(
+            &mut state,
+            land_id,
+            ManaType::Green,
+            PlayerId(0),
+            true,
+            &mut events,
+        );
+        state
+    }
+
+    fn mana_multiplier(factor: u32) -> crate::types::ability::ReplacementDefinition {
+        use crate::types::ability::{
+            ControllerRef, ManaModification, ManaReplacementScope, ReplacementDefinition,
+            TargetFilter, TypedFilter,
+        };
+        use crate::types::replacements::ReplacementEvent;
+        ReplacementDefinition::new(ReplacementEvent::ProduceMana)
+            .mana_modification(ManaModification::Multiply { factor })
+            .mana_replacement_scope(ManaReplacementScope::TappedForMana)
+            .valid_card(TargetFilter::Typed(
+                TypedFilter::permanent().controller(ControllerRef::You),
+            ))
+    }
+
+    /// CR 616.1 + CR 106.12b (issue #3654): Two mana-production multipliers
+    /// (Nyxbloom Ancient ×3 + Mana Reflection ×2) compound to 6×, not 1× or 2×.
+    /// Their orderings are observationally identical, so the pipeline must
+    /// auto-resolve both rather than parking for a degenerate ordering choice
+    /// that the immediate mana-ability path would otherwise drop.
+    #[test]
+    fn two_mana_multipliers_compound_to_product() {
+        let state = produce_green_under_replacements(vec![
+            ("Nyxbloom Ancient", mana_multiplier(3)),
+            ("Mana Reflection", mana_multiplier(2)),
+        ]);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Green), 6);
+    }
+
+    /// CR 616.1: Three stacked multipliers (×3 · ×2 · ×2) still compound to the
+    /// full product (12×) — the auto-resolve repeats until the chain drains.
+    #[test]
+    fn three_mana_multipliers_compound_to_product() {
+        let state = produce_green_under_replacements(vec![
+            ("Nyxbloom Ancient", mana_multiplier(3)),
+            ("Mana Reflection", mana_multiplier(2)),
+            ("Zhur-Taa Druid", mana_multiplier(2)),
+        ]);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Green), 12);
+    }
+
+    /// CR 616.1 + CR 605.3b: A multiplier (×3) together with an order-material
+    /// color override ("produces {B} instead") is genuinely a choice, so the
+    /// pipeline parks. The immediate mana-ability path must drain the chain —
+    /// applying BOTH — producing three Black mana, never silently dropping to a
+    /// single unit (the prior `_ => (mana_type, 1)` fallback bug).
+    #[test]
+    fn multiplier_with_color_override_drains_both() {
+        use crate::types::ability::{
+            ManaModification, ManaReplacementScope, ReplacementDefinition, TargetFilter,
+            TypedFilter,
+        };
+        use crate::types::replacements::ReplacementEvent;
+
+        let override_to_black = ReplacementDefinition::new(ReplacementEvent::ProduceMana)
+            .mana_modification(ManaModification::ReplaceWith {
+                mana_type: ManaType::Black,
+            })
+            .mana_replacement_scope(ManaReplacementScope::TappedForMana)
+            .valid_card(TargetFilter::Typed(TypedFilter::land()));
+
+        let state = produce_green_under_replacements(vec![
+            ("Nyxbloom Ancient", mana_multiplier(3)),
+            ("Contamination", override_to_black),
+        ]);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Black), 3);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Green), 0);
     }
 
     // --- can_pay tests ---
