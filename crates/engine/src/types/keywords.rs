@@ -2181,6 +2181,12 @@ impl FromStr for Keyword {
             "horsemanship" => Ok(Keyword::Horsemanship),
             "wither" => Ok(Keyword::Wither),
             "infect" => Ok(Keyword::Infect),
+            // CR 702.164: Bare "toxic" (as emitted by the "if that creature has
+            // toxic" condition parser) carries no count; default to 1. Keyword
+            // presence is matched by discriminant (`game::keywords::has_keyword`),
+            // so this matches a real `Toxic(N)` for any N. The "toxic N" colon
+            // form is parsed with its real count earlier in this function.
+            "toxic" => Ok(Keyword::Toxic(1)),
             "afflict" => Ok(Keyword::Afflict(1)),
             "frenzy" => Ok(Keyword::Frenzy(1)),
             "prowess" => Ok(Keyword::Prowess),
@@ -3357,6 +3363,22 @@ mod tests {
         assert_eq!(Keyword::from_str("Afflict:1").unwrap(), Keyword::Afflict(1));
         // Bare "afflict" without param defaults to 1
         assert_eq!(Keyword::from_str("afflict").unwrap(), Keyword::Afflict(1));
+    }
+
+    /// Issue #3890 / CR 702.164: Bare "toxic" — emitted by the "if that creature
+    /// has toxic" condition parser — must resolve to `Toxic(_)`, not an inert
+    /// `Unknown("toxic")` that can never match a real toxic creature. Presence is
+    /// matched by discriminant, so the count is irrelevant (defaults to 1). The
+    /// "Toxic N" colon form keeps its real count.
+    #[test]
+    fn parse_keyword_toxic_bare_and_n() {
+        assert_eq!(Keyword::from_str("toxic").unwrap(), Keyword::Toxic(1));
+        assert_eq!(Keyword::from_str("Toxic:3").unwrap(), Keyword::Toxic(3));
+        // The bare form must NOT fall through to the inert Unknown catch-all.
+        assert!(!matches!(
+            Keyword::from_str("toxic").unwrap(),
+            Keyword::Unknown(_)
+        ));
     }
 
     #[test]

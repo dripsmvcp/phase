@@ -5655,4 +5655,28 @@ mod tests {
                 if matches!(inner.as_ref(), AbilityCondition::Or { .. })
         ));
     }
+
+    /// Issue #3890 / CR 702.164: "If that creature has toxic, …" must gate on a
+    /// real `Toxic(_)` keyword. Before the fix, bare "toxic" parsed to an inert
+    /// `Unknown("toxic")` that could never match a toxic creature, so the rider
+    /// was silently dead (Hexgold Slash's 4-damage upgrade never fired).
+    #[test]
+    fn target_has_toxic_keyword_instead_binds_real_toxic() {
+        use crate::types::keywords::Keyword;
+
+        let (cond, body) = strip_target_keyword_instead(
+            "if that creature has toxic, Hexgold Slash deals 4 damage to that creature instead.",
+        );
+        let cond = cond.expect("\"if that creature has toxic\" must bind a condition");
+        assert!(
+            matches!(
+                cond,
+                AbilityCondition::TargetHasKeywordInstead {
+                    keyword: Keyword::Toxic(_),
+                }
+            ),
+            "expected TargetHasKeywordInstead {{ Toxic }}, got {cond:?}"
+        );
+        assert_eq!(body, "Hexgold Slash deals 4 damage to that creature");
+    }
 }
