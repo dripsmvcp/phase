@@ -5120,6 +5120,26 @@ fn resolve_chain_body(
                         cost: ManaCost::generic(amount.max(0) as u32),
                     }
                 }
+                // CR 118.12 + CR 202.1: "unless you pay its mana cost" — the
+                // alternative cost is the ability source's own printed mana
+                // cost (Pendrell Flux / Disruption Aura upkeep tax). Resolve
+                // `SelfManaCost` against the source object now, before the
+                // payment prompt — the runtime payment site only handles a
+                // fixed `ManaCost::Cost`. A source with no printed mana cost
+                // (a token / land enchanted by the Aura) has mana value 0
+                // (CR 202.3), so it resolves to {0} and the CR 118.5
+                // zero-cost short-circuit applies (the controller always pays).
+                AbilityCost::Mana {
+                    cost: ManaCost::SelfManaCost,
+                } => {
+                    let source_cost = state
+                        .objects
+                        .get(&ability.source_id)
+                        .map(|obj| obj.mana_cost.clone())
+                        .filter(|cost| !matches!(cost, ManaCost::NoCost | ManaCost::SelfManaCost))
+                        .unwrap_or_else(ManaCost::zero);
+                    AbilityCost::Mana { cost: source_cost }
+                }
                 other => other.clone(),
             };
             // CR 118.5 + CR 118.12a: Zero-mana unless cost short-circuit.
@@ -8649,6 +8669,65 @@ mod tests {
                         cost: ManaCost::generic(6),
                     }
                 );
+            }
+            other => panic!("expected WaitingFor::UnlessPayment, got {other:?}"),
+        }
+    }
+
+    /// Issue #3791 / CR 118.12 + CR 202.1: "sacrifice this unless you pay its
+    /// mana cost" (Pendrell Flux / Disruption Aura). The unless-cost carries
+    /// `ManaCost::SelfManaCost`; the resolver must resolve it to the source
+    /// object's printed cost — preserving colored pips, not just mana value —
+    /// before arming the payment prompt.
+    #[test]
+    fn unless_pay_its_mana_cost_resolves_to_source_printed_cost() {
+        use crate::types::mana::ManaCostShard;
+
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Pendrell Flux Host".to_string(),
+            Zone::Battlefield,
+        );
+        // The enchanted permanent's printed cost is {2}{G} — a colored cost so
+        // the test proves the full cost (pips) is carried, not just mana value.
+        let printed = ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 2,
+        };
+        state
+            .objects
+            .get_mut(&source)
+            .expect("source object exists")
+            .mana_cost = printed.clone();
+
+        let mut ability = ResolvedAbility::new(
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            },
+            vec![TargetRef::Object(source)],
+            source,
+            PlayerId(0),
+        );
+        ability.unless_pay = Some(crate::types::ability::UnlessPayModifier {
+            cost: AbilityCost::Mana {
+                cost: ManaCost::SelfManaCost,
+            },
+            payer: TargetFilter::Controller,
+        });
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0)
+            .expect("unless-pay interceptor should arm a payment prompt");
+
+        match &state.waiting_for {
+            WaitingFor::UnlessPayment { player, cost, .. } => {
+                assert_eq!(*player, PlayerId(0));
+                assert_eq!(*cost, AbilityCost::Mana { cost: printed });
             }
             other => panic!("expected WaitingFor::UnlessPayment, got {other:?}"),
         }

@@ -1928,6 +1928,15 @@ fn parse_unless_alt_cost(after_unless: &str) -> Option<AbilityCost> {
         if let Some(cost) = parse_unless_life_cost(rest) {
             return Some(cost);
         }
+        // CR 118.12 + CR 202.1: "you pay its mana cost" — the alternative cost
+        // is the ability source's own printed mana cost (dynamic, resolved at
+        // payment time). Pendrell Flux / Disruption Aura / Pendrell Mists /
+        // Scarwood Bandits: "sacrifice this [permanent] unless you pay its mana
+        // cost." Carried as `ManaCost::SelfManaCost`, resolved against the
+        // source object's `mana_cost` by the unless-pay resolver.
+        if let Some(cost) = parse_unless_source_mana_cost(rest) {
+            return Some(cost);
+        }
     }
 
     // "you sacrifice [count] [filter]" — delegates filter parsing to the shared
@@ -1960,6 +1969,31 @@ fn parse_unless_alt_cost(after_unless: &str) -> Option<AbilityCost> {
     }
 
     None
+}
+
+/// CR 118.12 + CR 202.1: Parse "its mana cost" as an "unless you pay ..."
+/// alternative cost. `rest` is the lowercase tail immediately after the
+/// `"you pay "` prefix. The cost is the ability source's own printed mana cost,
+/// which is dynamic — it depends on which permanent the granting Aura is
+/// attached to (Pendrell Flux) — so it cannot be baked into a fixed
+/// `ManaCost::Cost` at parse time. It is carried as `ManaCost::SelfManaCost`
+/// and resolved against `ability.source_id.mana_cost` by the unless-pay
+/// resolver in `game/effects/mod.rs`. Only a clean clause end (optional
+/// trailing period) is accepted, so richer tails ("its mana cost or ...") fall
+/// through rather than misparse.
+fn parse_unless_source_mana_cost(rest: &str) -> Option<AbilityCost> {
+    let (remainder, _) = tag::<_, _, OracleError<'_>>("its mana cost")
+        .parse(rest.trim_start())
+        .ok()?;
+    all_consuming((
+        opt(tag::<_, _, OracleError<'_>>(".")),
+        eof::<_, OracleError<'_>>,
+    ))
+    .parse(remainder.trim())
+    .ok()?;
+    Some(AbilityCost::Mana {
+        cost: crate::types::mana::ManaCost::SelfManaCost,
+    })
 }
 
 /// CR 118.12 + CR 701.20a: Parse the tail of "you tap ..." unless costs.
@@ -21379,16 +21413,50 @@ mod tests {
         );
     }
 
+    /// Issue #3791 / CR 118.12 + CR 202.1: "unless you pay its mana cost" is the
+    /// own-mana-cost upkeep tax (Pendrell Flux, Disruption Aura, Pendrell Mists,
+    /// Scarwood Bandits). It binds to the source's printed cost via
+    /// `ManaCost::SelfManaCost`, resolved against the source object at payment
+    /// time. The payer is the controller ("you").
     #[test]
-    fn trigger_unless_you_pay_mana_cost_is_not_unless_pay() {
+    fn trigger_unless_you_pay_its_mana_cost_binds_self_mana_cost() {
+        let def = parse_trigger_line(
+            "At the beginning of your upkeep, sacrifice this creature unless you pay its mana cost.",
+            "Pendrell Flux",
+        );
+        let unless_pay = def
+            .unless_pay
+            .as_ref()
+            .expect("\"unless you pay its mana cost\" must bind an unless-cost");
+        assert_eq!(unless_pay.payer, TargetFilter::Controller);
+        assert_eq!(
+            unless_pay.cost,
+            AbilityCost::Mana {
+                cost: crate::types::mana::ManaCost::SelfManaCost,
+            },
+            "cost must carry SelfManaCost, got {:?}",
+            unless_pay.cost
+        );
+    }
+
+    /// CR 118.12 + CR 202.1: the same binding from the entry-trigger shape
+    /// ("draw a card unless you pay its mana cost"), confirming the parse is
+    /// the trigger effect's unless-cost and not tied to the upkeep wording.
+    #[test]
+    fn trigger_unless_you_pay_its_mana_cost_on_entry_trigger() {
         let def = parse_trigger_line(
             "When this creature enters, draw a card unless you pay its mana cost.",
             "Test Card",
         );
-        assert!(
-            def.unless_pay.is_none(),
-            "\"pay its mana cost\" is not a recognized unless-cost, got {:?}",
-            def.unless_pay
+        let unless_pay = def
+            .unless_pay
+            .as_ref()
+            .expect("\"unless you pay its mana cost\" must bind an unless-cost");
+        assert_eq!(
+            unless_pay.cost,
+            AbilityCost::Mana {
+                cost: crate::types::mana::ManaCost::SelfManaCost,
+            },
         );
     }
 
