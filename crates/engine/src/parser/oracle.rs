@@ -1704,7 +1704,159 @@ pub(crate) fn lower_oracle_ir(ir: &OracleDocIr) -> ParsedAbilities {
     // trigger stays registered as-is (its TrackedSet target gracefully resolves
     // to nothing when the exile link has already returned the card).
     synthesize_etb_exile_ltb_return_pair(&mut result.triggers);
+
+    // CR 608.2c + CR 701.19c: Fold a "creatures/a creature destroyed this way
+    // can't be regenerated" rider into the Destroy/DestroyAll it modifies when an
+    // intervening clause separated them (e.g. Kirtar's Wrath's threshold mode:
+    // "destroy all creatures, then create two ... tokens. Creatures destroyed
+    // this way can't be regenerated."). The adjacent form is already absorbed by
+    // the clause linker; the separated form is chained as a standalone
+    // Unimplemented rider that this pass reattaches.
+    for ability in result.abilities.iter_mut() {
+        fold_cant_be_regenerated_riders(ability);
+    }
+    for trigger in result.triggers.iter_mut() {
+        if let Some(exec) = trigger.execute.as_deref_mut() {
+            fold_cant_be_regenerated_riders(exec);
+        }
+    }
     result
+}
+
+/// Classification of a single node in a `sub_ability` chain for the
+/// `fold_cant_be_regenerated_riders` normalization.
+enum RegenNodeClass {
+    /// `Effect::Destroy` / `Effect::DestroyAll` — a regeneration-suppressible
+    /// instruction whose `cant_regenerate` flag a trailing rider can set.
+    Destroy,
+    /// A separated "… destroyed this way can't be regenerated" rider that was
+    /// chained as a standalone `Effect::Unimplemented` placeholder.
+    Rider,
+    Other,
+}
+
+/// CR 701.19c: A "… destroyed this way can't be regenerated" rider back-references
+/// an earlier Destroy. Detected on the standalone `Effect::Unimplemented`
+/// placeholder the clause splitter emits when the rider is not adjacent to its
+/// Destroy. Gated on the "destroyed this way" anaphor so a generic
+/// "they can't be regenerated" (already bound by the adjacent-clause linker) is
+/// never re-bound here.
+fn is_cant_be_regenerated_rider(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    scan_contains(&lower, "destroyed this way")
+        && (scan_contains(&lower, "can't be regenerated")
+            || scan_contains(&lower, "cannot be regenerated"))
+}
+
+fn classify_regen_node(effect: &Effect) -> RegenNodeClass {
+    match effect {
+        Effect::Destroy { .. } | Effect::DestroyAll { .. } => RegenNodeClass::Destroy,
+        Effect::Unimplemented {
+            description: Some(desc),
+            ..
+        } if is_cant_be_regenerated_rider(desc) => RegenNodeClass::Rider,
+        _ => RegenNodeClass::Other,
+    }
+}
+
+/// Set the `cant_regenerate` flag on a Destroy/DestroyAll effect; no-op otherwise.
+fn set_cant_regenerate(effect: &mut Effect) {
+    match effect {
+        Effect::Destroy {
+            cant_regenerate, ..
+        }
+        | Effect::DestroyAll {
+            cant_regenerate, ..
+        } => *cant_regenerate = true,
+        _ => {}
+    }
+}
+
+/// CR 608.2c + CR 701.19c: Reattach a separated "… destroyed this way can't be
+/// regenerated" rider to the nearest preceding Destroy/DestroyAll in the same
+/// `sub_ability` chain, then splice the placeholder rider out of the chain.
+///
+/// When the rider is adjacent to its Destroy ("Destroy all creatures. They can't
+/// be regenerated.") the clause linker (`apply_clause_continuation`) already sets
+/// `cant_regenerate`. But when an intervening clause separates them — e.g. a
+/// `Token` sibling in Kirtar's Wrath's threshold mode — the rider is chained as a
+/// standalone `Effect::Unimplemented` after that clause and the flag is never set,
+/// silently producing a strictly-better card (creatures regenerate when they
+/// should not). Fail-closed: a rider with no preceding Destroy/DestroyAll in its
+/// chain is left untouched (no silent drop). Recurses into `else_ability` and
+/// `mode_abilities` so riders inside conditional/modal branches are handled too.
+fn fold_cant_be_regenerated_riders(def: &mut AbilityDefinition) {
+    // Detach the `sub_ability` chain after the head into a flat Vec so the chain
+    // can be reasoned about by index without juggling mutable borrows; the head
+    // (index 0) stays in place. Each detached node keeps its own subtrees.
+    let mut chain: Vec<AbilityDefinition> = Vec::new();
+    let mut rest = def.sub_ability.take();
+    while let Some(mut node) = rest {
+        rest = node.sub_ability.take();
+        chain.push(*node);
+    }
+
+    // Plan pass (immutable): walk head + chain in order tracking the nearest
+    // preceding Destroy/DestroyAll. For each rider, record which destroy to mark
+    // (`None` = head, `Some(i)` = chain[i]) and the rider's index to remove.
+    let mut last_destroy: Option<Option<usize>> = match classify_regen_node(&def.effect) {
+        // A rider can never be the head (a Destroy always precedes it).
+        RegenNodeClass::Destroy => Some(None),
+        RegenNodeClass::Rider | RegenNodeClass::Other => None,
+    };
+    let mut mark_head = false;
+    let mut mark_chain: Vec<usize> = Vec::new();
+    let mut remove: Vec<usize> = Vec::new();
+    for (i, node) in chain.iter().enumerate() {
+        match classify_regen_node(&node.effect) {
+            RegenNodeClass::Destroy => last_destroy = Some(Some(i)),
+            RegenNodeClass::Rider => {
+                if let Some(target) = last_destroy {
+                    match target {
+                        None => mark_head = true,
+                        Some(ci) => mark_chain.push(ci),
+                    }
+                    remove.push(i);
+                }
+            }
+            RegenNodeClass::Other => {}
+        }
+    }
+
+    // Apply pass (mutable): set flags, then splice out riders deepest-first.
+    if mark_head {
+        set_cant_regenerate(&mut def.effect);
+    }
+    for &ci in &mark_chain {
+        set_cant_regenerate(&mut chain[ci].effect);
+    }
+    for &i in remove.iter().rev() {
+        chain.remove(i);
+    }
+
+    // Normalize nested subtrees on the head and every (surviving) chain node.
+    normalize_nested_regen_subtrees(def);
+    for node in chain.iter_mut() {
+        normalize_nested_regen_subtrees(node);
+    }
+
+    // Rebuild the `sub_ability` chain from the surviving nodes.
+    let mut next: Option<Box<AbilityDefinition>> = None;
+    for mut node in chain.into_iter().rev() {
+        node.sub_ability = next;
+        next = Some(Box::new(node));
+    }
+    def.sub_ability = next;
+}
+
+/// Recurse the regen-rider fold into a node's conditional/modal branches.
+fn normalize_nested_regen_subtrees(node: &mut AbilityDefinition) {
+    if let Some(else_ab) = node.else_ability.as_deref_mut() {
+        fold_cant_be_regenerated_riders(else_ab);
+    }
+    for mode in node.mode_abilities.iter_mut() {
+        fold_cant_be_regenerated_riders(mode);
+    }
 }
 
 /// CR 607.1 + CR 610.3: Detect an (ETB exile, LTB return) trigger pair and
@@ -17078,6 +17230,138 @@ mod tests {
                 ..
             } if name == "fellowship"
         ));
+    }
+
+    /// Collect every effect in an ability tree (head + `sub_ability` chain,
+    /// recursing into `else_ability` and `mode_abilities`).
+    fn collect_effects<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+        out.push(&def.effect);
+        if let Some(else_ab) = def.else_ability.as_deref() {
+            collect_effects(else_ab, out);
+        }
+        for mode in &def.mode_abilities {
+            collect_effects(mode, out);
+        }
+        if let Some(sub) = def.sub_ability.as_deref() {
+            collect_effects(sub, out);
+        }
+    }
+
+    fn any_destroy_cant_regenerate(p: &ParsedAbilities) -> bool {
+        let mut effects = Vec::new();
+        for a in &p.abilities {
+            collect_effects(a, &mut effects);
+        }
+        effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::Destroy {
+                    cant_regenerate: true,
+                    ..
+                } | Effect::DestroyAll {
+                    cant_regenerate: true,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn count_unimplemented(p: &ParsedAbilities) -> usize {
+        let mut effects = Vec::new();
+        for a in &p.abilities {
+            collect_effects(a, &mut effects);
+        }
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Unimplemented { .. }))
+            .count()
+    }
+
+    /// Issue #3343 (destroy-form): a "creatures/a creature destroyed this way
+    /// can't be regenerated" rider separated from its Destroy/DestroyAll by an
+    /// intervening clause (a `Token` sibling) must still set `cant_regenerate`,
+    /// not leak as a standalone `Unimplemented`. Kirtar's Wrath's threshold mode
+    /// is the motivating card ("destroy all creatures, then create two 1/1 white
+    /// Bird creature tokens with flying. Creatures destroyed this way can't be
+    /// regenerated."). CR 608.2c + CR 701.19c.
+    #[test]
+    fn cant_be_regenerated_rider_folds_across_intervening_token_destroy_all() {
+        let p = parse(
+            "Destroy all creatures, then create two 1/1 white Bird creature tokens with flying. \
+             Creatures destroyed this way can't be regenerated.",
+            "Kirtar's Wrath",
+            &[],
+            &["Sorcery"],
+            &[],
+        );
+        assert!(
+            any_destroy_cant_regenerate(&p),
+            "DestroyAll must carry cant_regenerate after folding the separated rider"
+        );
+        assert_eq!(
+            count_unimplemented(&p),
+            0,
+            "the regen rider must be absorbed, not left as an Unimplemented placeholder"
+        );
+    }
+
+    /// Singular "A creature destroyed this way can't be regenerated" rider across
+    /// an intervening clause must fold into a single-target `Destroy`.
+    #[test]
+    fn cant_be_regenerated_rider_folds_across_intervening_clause_destroy_target() {
+        let p = parse(
+            "Destroy target creature, then create a Treasure token. \
+             A creature destroyed this way can't be regenerated.",
+            "Test Destroy",
+            &[],
+            &["Sorcery"],
+            &[],
+        );
+        assert!(
+            any_destroy_cant_regenerate(&p),
+            "Destroy must carry cant_regenerate after folding the separated rider"
+        );
+        assert_eq!(count_unimplemented(&p), 0);
+    }
+
+    /// Regression: the adjacent form ("Destroy all creatures. They can't be
+    /// regenerated.") was already handled by the clause linker and must remain so.
+    #[test]
+    fn cant_be_regenerated_rider_adjacent_still_sets_flag() {
+        let p = parse(
+            "Destroy all creatures. They can't be regenerated.",
+            "Wrath-like",
+            &[],
+            &["Sorcery"],
+            &[],
+        );
+        assert!(any_destroy_cant_regenerate(&p));
+        assert_eq!(count_unimplemented(&p), 0);
+    }
+
+    /// Fail-closed: a "destroyed this way can't be regenerated" rider with no
+    /// preceding Destroy/DestroyAll in its chain must NOT be silently dropped —
+    /// it stays as an Unimplemented placeholder (a visible coverage gap) rather
+    /// than vanishing into a no-op.
+    #[test]
+    fn cant_be_regenerated_rider_without_destroy_is_preserved() {
+        let p = parse(
+            "Create two 1/1 white Soldier creature tokens. \
+             Creatures destroyed this way can't be regenerated.",
+            "No Destroy Here",
+            &[],
+            &["Sorcery"],
+            &[],
+        );
+        assert!(
+            !any_destroy_cant_regenerate(&p),
+            "no Destroy present, so nothing should be marked"
+        );
+        assert_eq!(
+            count_unimplemented(&p),
+            1,
+            "the dangling rider must remain visible as Unimplemented"
+        );
     }
 }
 
