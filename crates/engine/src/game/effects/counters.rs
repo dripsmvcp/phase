@@ -383,14 +383,16 @@ fn apply_pending_counter_post_action(
             }
             true
         }
-        PendingCounterPostAction::InjectPredefinedTokenAbilities { object_id } => {
-            // CR 111.10 + CR 400.7: Incubator tokens get predefined
-            // subtype abilities and battlefield-entry bookkeeping after their
-            // replacement-processed counters finish.
-            super::token::inject_predefined_token_abilities(state, object_id);
-            crate::game::layers::mark_layers_entered(state, object_id);
-            crate::game::restrictions::record_battlefield_entry(state, object_id);
-            crate::game::restrictions::record_token_created(state, object_id);
+        PendingCounterPostAction::InjectPredefinedTokenAbilities {
+            object_id,
+            source_id,
+        } => {
+            // CR 111.1 + CR 111.10 + CR 603.6a: once the Incubator's
+            // replacement-processed ETB counters finish, complete its
+            // battlefield entry — predefined abilities, bookkeeping, AND the ETB
+            // `{ZoneChanged, TokenCreated}` pair — exactly as the immediate path
+            // does, so entering-permanent triggers fire for the Incubator.
+            super::incubate::finalize_incubator_entry(state, object_id, source_id, events);
             true
         }
         PendingCounterPostAction::FinalizeTokenEntry {
@@ -610,7 +612,7 @@ fn apply_pending_counter_post_action(
     }
 }
 
-fn push_token_entry_events(
+pub(crate) fn push_token_entry_events(
     state: &GameState,
     events: &mut Vec<GameEvent>,
     object_id: ObjectId,

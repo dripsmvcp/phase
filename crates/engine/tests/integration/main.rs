@@ -3,6 +3,7 @@ mod abundance_optional_draw_replacement;
 mod adapter_contract_fixtures;
 mod advanced_reconstruction_regression;
 mod ajani_nacatl_pariah_transform;
+mod altar_of_the_brood_incubate_etb;
 mod amphin_mutineer_regression;
 mod anaphoric_scope_allowlist_guard;
 mod ancient_brass_dragon_roll_d20;

@@ -10,7 +10,7 @@ use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{GameState, PendingCounterPostAction};
-use crate::types::identifiers::CardId;
+use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::zones::Zone;
 
 /// CR 701.53a: Incubate N — create an Incubator token that enters the
@@ -75,12 +75,15 @@ pub fn resolve(
             state,
             EffectKind::Incubate,
             ability.source_id,
-            vec![PendingCounterPostAction::InjectPredefinedTokenAbilities { object_id: obj_id }],
+            vec![PendingCounterPostAction::InjectPredefinedTokenAbilities {
+                object_id: obj_id,
+                source_id: ability.source_id,
+            }],
         );
         return Ok(());
     }
 
-    super::token::inject_predefined_token_abilities(state, obj_id);
+    finalize_incubator_entry(state, obj_id, ability.source_id, events);
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::Incubate,
@@ -88,6 +91,41 @@ pub fn resolve(
     });
 
     Ok(())
+}
+
+/// CR 111.1 + CR 603.6a: Complete the Incubator token's battlefield entry the
+/// same way the uninterrupted token path does — inject predefined abilities, run
+/// the layer/restriction bookkeeping, and emit the ETB `{ZoneChanged(from:None,
+/// to:Battlefield), TokenCreated}` pair. Without the `ZoneChanged` ETB event no
+/// "another permanent you control enters" trigger (Altar of the Brood, Soul
+/// Warden, Panharmonicon) ever fires for the Incubator, because it was placed on
+/// the battlefield by `zones::create_object` (which emits no events). Single
+/// authority for finishing an Incubator entry, shared by the immediate path and
+/// the replacement-deferred counter-completion path.
+pub(crate) fn finalize_incubator_entry(
+    state: &mut GameState,
+    obj_id: ObjectId,
+    source_id: ObjectId,
+    events: &mut Vec<GameEvent>,
+) {
+    // CR 111.10 + CR 400.7: predefined Incubator/Phyrexian abilities + ETB bookkeeping.
+    super::token::inject_predefined_token_abilities(state, obj_id);
+    crate::game::layers::mark_layers_entered(state, obj_id);
+    crate::game::restrictions::record_battlefield_entry(state, obj_id);
+    crate::game::restrictions::record_token_created(state, obj_id);
+    // CR 111.1 + CR 603.6a: the token entering the battlefield is a zone change
+    // from outside the game; emit the ETB pair so every entering-permanent
+    // trigger matcher observes it.
+    super::counters::push_token_entry_events(
+        state,
+        events,
+        obj_id,
+        "Incubator".to_string(),
+        source_id,
+    );
+    // CR 603.7: the Incubator is the most-recently-created token for
+    // `TargetFilter::LastCreated` consumers.
+    state.last_created_token_ids = vec![obj_id];
 }
 
 #[cfg(test)]
@@ -133,6 +171,58 @@ mod tests {
         assert_eq!(inc.abilities.len(), 1);
         assert!(matches!(*inc.abilities[0].effect, Effect::Transform { .. }));
         assert!(inc.back_face.is_some());
+    }
+
+    #[test]
+    fn incubate_emits_etb_zone_change_and_token_created() {
+        // CR 111.1 + CR 603.6a: the Incubator entering the battlefield is a zone
+        // change from outside the game, so Incubate must emit the ETB
+        // `{ZoneChanged(from:None,to:Battlefield), TokenCreated}` pair. Without
+        // it, no "another permanent you control enters" trigger (Altar of the
+        // Brood, Soul Warden) would ever fire for the Incubator (issue #4238).
+        let mut state = GameState::new_two_player(42);
+        let mut events = Vec::new();
+        let ability = make_incubate_ability(QuantityExpr::Fixed { value: 1 });
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let incubator = state
+            .battlefield
+            .iter()
+            .find(|id| {
+                state
+                    .objects
+                    .get(id)
+                    .is_some_and(|o| o.card_types.subtypes.iter().any(|s| s == "Incubator"))
+            })
+            .copied()
+            .expect("Incubator token on battlefield");
+
+        let etb = events.iter().any(|e| {
+            matches!(
+                e,
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from: None,
+                    to: Zone::Battlefield,
+                    ..
+                } if *object_id == incubator
+            )
+        });
+        assert!(
+            etb,
+            "Incubate must emit an ETB ZoneChanged for the Incubator"
+        );
+
+        let token_created = events.iter().any(
+            |e| matches!(e, GameEvent::TokenCreated { object_id, .. } if *object_id == incubator),
+        );
+        assert!(
+            token_created,
+            "Incubate must emit TokenCreated for the Incubator"
+        );
+
+        assert_eq!(state.last_created_token_ids, vec![incubator]);
     }
 
     #[test]

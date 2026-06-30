@@ -1144,6 +1144,7 @@ pub enum PendingCounterPostAction {
     },
     InjectPredefinedTokenAbilities {
         object_id: ObjectId,
+        source_id: ObjectId,
     },
     FinalizeTokenEntry {
         object_id: ObjectId,
